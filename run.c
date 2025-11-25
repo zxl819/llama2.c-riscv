@@ -70,7 +70,8 @@ typedef struct {
     RunState state; // buffers for the "wave" of activations in the forward pass
     // some more state needed to properly clean up the memory mapping (sigh)
     int fd; // file descriptor for memory mapping
-    float* data; // memory mapped data pointer
+    float* data; // memory mapped data pointer (or malloc'd buffer when mmap unavailable)
+    int data_is_mmap; // 1 if data was populated via mmap, 0 if malloc+fread fallback
     ssize_t file_size; // size of the checkpoint file in bytes
 } Transformer;
 
@@ -138,13 +139,14 @@ void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared
     ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_imag (for RoPE)
     w->wcls = shared_weights ? w->token_embedding_table : ptr;
 }
-
+// 删掉了
 void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
-                     int* fd, float** data, ssize_t* file_size) {
+                     int* fd, float** data, ssize_t* file_size, int* data_is_mmap) {
+    // open file to read the header
     FILE *file = fopen(checkpoint, "rb");
     if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); exit(EXIT_FAILURE); }
     // read in the config header
-    if (fread(config, sizeof(Config), 1, file) != 1) { exit(EXIT_FAILURE); }
+    if (fread(config, sizeof(Config), 1, file) != 1) { fclose(file); exit(EXIT_FAILURE); }
     // negative vocab size is hacky way of signaling unshared weights. bit yikes.
     int shared_weights = config->vocab_size > 0 ? 1 : 0;
     config->vocab_size = abs(config->vocab_size);
@@ -152,25 +154,64 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     fseek(file, 0, SEEK_END); // move file pointer to end of file
     *file_size = ftell(file); // get the file size, in bytes
     fclose(file);
-    // memory map the Transformer weights into the data pointer
+
+    // Try mmap first (fast), but fall back to malloc+fread if mmap/open fail (useful for some simulators)
     *fd = open(checkpoint, O_RDONLY); // open in read only mode
-    if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
-    *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
-    if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
+    if (*fd == -1) {
+        // open failed -> fallback to fread into malloc'd buffer
+        FILE *f2 = fopen(checkpoint, "rb");
+        if (!f2) { fprintf(stderr, "open/fopen failed for %s\n", checkpoint); exit(EXIT_FAILURE); }
+        void* buf = malloc(*file_size);
+        if (!buf) { fprintf(stderr, "malloc failed for checkpoint buffer\n"); exit(EXIT_FAILURE); }
+        fseek(f2, 0, SEEK_SET);
+        size_t got = fread(buf, 1, *file_size, f2);
+        fclose(f2);
+        if (got != (size_t)*file_size) { fprintf(stderr, "fread failed (got %zu expected %zd)\n", got, *file_size); exit(EXIT_FAILURE); }
+        *data = (float*)buf;
+        *data_is_mmap = 0;
+    } else {
+        // we opened the fd successfully, try mmap
+        *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
+        if (*data == MAP_FAILED) {
+            // mmap failed -> close fd and fallback to fread into malloc'd buffer
+            close(*fd);
+            *fd = -1;
+            FILE *f2 = fopen(checkpoint, "rb");
+            if (!f2) { fprintf(stderr, "mmap failed and fopen failed for %s\n", checkpoint); exit(EXIT_FAILURE); }
+            void* buf = malloc(*file_size);
+            if (!buf) { fprintf(stderr, "malloc failed for checkpoint buffer\n"); exit(EXIT_FAILURE); }
+            fseek(f2, 0, SEEK_SET);
+            size_t got = fread(buf, 1, *file_size, f2);
+            fclose(f2);
+            if (got != (size_t)*file_size) { fprintf(stderr, "fread failed (got %zu expected %zd)\n", got, *file_size); exit(EXIT_FAILURE); }
+            *data = (float*)buf;
+            *data_is_mmap = 0;
+        } else {
+            // mmap succeeded
+            *data_is_mmap = 1;
+        }
+    }
+
     float* weights_ptr = *data + sizeof(Config)/sizeof(float);
     memory_map_weights(weights, config, weights_ptr, shared_weights);
 }
-
+//改为init_transformer_from_embedded
 void build_transformer(Transformer *t, char* checkpoint_path) {
     // read in the Config and the Weights from the checkpoint
-    read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
+    read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size, &t->data_is_mmap);
     // allocate the RunState buffers
     malloc_run_state(&t->state, &t->config);
 }
 
 void free_transformer(Transformer* t) {
     // close the memory mapping
-    if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
+    if (t->data != MAP_FAILED) {
+        if (t->data_is_mmap) {
+            munmap(t->data, t->file_size);
+        } else {
+            free(t->data);
+        }
+    }
     if (t->fd != -1) { close(t->fd); }
     // free the RunState buffers
     free_run_state(&t->state);
@@ -377,11 +418,11 @@ typedef struct {
     unsigned int max_token_length;
     unsigned char byte_pieces[512]; // stores all single-byte strings
 } Tokenizer;
-
+// swap_token
 int compare_tokens(const void *a, const void *b) {
     return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
 }
-
+//quicksort
 void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
     // i should have written the vocab_size into the tokenizer file... sigh
     t->vocab_size = vocab_size;
@@ -612,7 +653,7 @@ int sample_mult(float* probabilities, int n, float coin) {
     }
     return n - 1; // in case of rounding errors
 }
-
+//build_sampler
 int compare(const void* a, const void* b) {
     ProbIndex* a_ = (ProbIndex*) a;
     ProbIndex* b_ = (ProbIndex*) b;
@@ -672,7 +713,7 @@ void build_sampler(Sampler* sampler, int vocab_size, float temperature, float to
     // buffer only used with nucleus sampling; may not need but it's ~small
     sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
 }
-
+//delete
 void free_sampler(Sampler* sampler) {
     free(sampler->probindex);
 }
@@ -798,7 +839,7 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
 // I manually inspected the tokens for a few chat conversations compared to
 // python reference and that seemed ok, but this was not thoroughly tested and
 // is not safely implemented, it's more a proof of concept atm.
-
+//delete
 void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
           char *cli_user_prompt, char *cli_system_prompt, int steps) {
 
