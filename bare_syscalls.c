@@ -11,6 +11,7 @@
 #endif
 
 #define SYS_write 64
+#define SYS_read 63
 
 #undef strcmp
 
@@ -315,4 +316,12 @@ long atol(const char* str)
   if (*str == '-' || *str == '+') { sign = *str == '-'; str++; }
   while (*str) { res *= 10; res += *str++ - '0'; }
   return sign ? -res : res;
+}
+
+int getchar()
+{
+  char buf[1];
+  long n = syscall(SYS_read, 0, (uintptr_t)buf, 1);
+  if (n > 0) return buf[0];
+  return -1;
 }
