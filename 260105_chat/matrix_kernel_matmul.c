@@ -58,6 +58,7 @@ int matrix_kernel_matmul_i8_i32_abt(const int8_t *A, const int8_t *B, int32_t *C
             // }
 #endif
             matrix_kernel_mlce32_acc0((const int32_t *)cptr, ldc_bytes);
+            //debug_delay_cycles(2000);
 
             for (int kk = 0; kk < k; kk += tile_k) {
                 tile_k = matrix_kernel_msettilek(k - kk);
@@ -70,14 +71,17 @@ int matrix_kernel_matmul_i8_i32_abt(const int8_t *A, const int8_t *B, int32_t *C
 //                 print_uart("\r\n");
 // #endif
                 matrix_kernel_mlae8_tr0(aptr, lda_bytes);
+                //debug_delay_cycles(2000);
                 matrix_kernel_mlbe8_tr1(bptr, ldb_bytes);
+                //debug_delay_cycles(2000);
                 matrix_kernel_mqma_b_acc0_tr0_tr1();
+                //debug_delay_cycles(2000);
             }
 
             matrix_kernel_msce32_acc0(cptr, ldc_bytes);
-            debug_delay_cycles(200);
+            debug_delay_cycles(200);//debug4非CT 200
         }
     }
-    debug_delay_cycles(50);
+    debug_delay_cycles(100);//debug4非CT 100
     //return 0;
 }

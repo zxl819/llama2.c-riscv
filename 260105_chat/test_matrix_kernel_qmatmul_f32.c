@@ -236,7 +236,7 @@ int main(void) {
     enable_vector_state();
     init_uart(CLOCK_FREQUENCY, UART_BITRATE);
 
-    print_uart("[test] matrix_kernel_qmatmul_f32...\r\n");
+    //print_uart("[test] matrix_kernel_qmatmul_f32...\r\n");
 
     // Test sizes.
     // IMPORTANT: matrix_kernel_qmatmul_f32 assumes N is a multiple of GS so that
@@ -285,7 +285,8 @@ int main(void) {
 
     // Run kernel (use noblk variant) and reference
     matrix_kernel_qmatmul_f32_noblk(out, xq, xs, wq, ws, N, D, GS, N);
-    print_uart_hex((uint64_t)(uintptr_t)out);
+    //print_uart_hex((uint64_t)(uintptr_t)out);
+    //asm volatile(".word 0x4200007b");
     debug_delay_cycles(100);
     ref_qmatmul_f32(ref, xq, xs, wq, ws, N, D, GS);
 

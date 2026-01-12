@@ -21,5 +21,25 @@ extern void matrix_kernel_qmatmul_f32_noblk(float *xout,
                                                                   int d,
                                                                   int gs,
                                                                   int w_row_stride);
+extern void matrix_kernel_qmatmul_f32_noblk_CT(float *xout,
+                                                                  const int8_t *xq,
+                                                                  const float *xs,
+                                                                  const int8_t *wq,
+                                                                  const float *ws,
+                                                                  int n,
+                                                                  int d,
+                                                                  int gs,
+                                                                  int w_row_stride);
+
+extern void matrix_kernel_qmatmul_f32_noblk_batch(float *xout,
+                                      const int8_t *xq,
+                                      const float *xs,
+                                      const int8_t *wq,
+                                      const float *ws,
+                                      int n,
+                                      int d,
+                                      int gs,
+                                      int w_row_stride,
+                                      int batch);
 
 #endif // MATRIX_KERNEL_NOBLK_H

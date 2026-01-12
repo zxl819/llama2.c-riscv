@@ -24,7 +24,7 @@
 // You can also reduce spam with: -DMATRIX_KERNEL_DEBUG_PRINT_EVERY=128
 
 #ifndef MATRIX_KERNEL_DEBUG_PRINT
-#define MATRIX_KERNEL_DEBUG_PRINT 1
+#define MATRIX_KERNEL_DEBUG_PRINT 0
 #endif
 
 #ifndef MATRIX_KERNEL_DEBUG_PRINT_EVERY
@@ -418,8 +418,7 @@ print_uart("=== matrix_kernel_rvv_zero_i32_sub entered ===\r\n");
 // ws_vec is loaded with strided load: ws_base + r * ws_stride_bytes.
 extern void matrix_kernel_rvv_accum_i32_to_f32_ws_xs(float *dst,
                                                             const int32_t *src_i32,
-                                                            const float *ws_base,
-                                                            ptrdiff_t ws_stride_bytes,
+                                                            const float *ws,
                                                             float xs,
                                                             int n);
 
@@ -714,7 +713,7 @@ debug_delay_cycles(50);
             }
 #endif
             matrix_kernel_rvv_accum_i32_to_f32_ws_xs(
-                xout + i0, c_pack, ws_base, ws_stride_bytes, xs[g], mblk);
+                xout + i0, c_pack, ws_base, xs[g], mblk);
 
 #if MATRIX_KERNEL_DEBUG_PRINT && MATRIX_KERNEL_DEBUG_VERBOSE
             // if ((MATRIX_KERNEL_DEBUG_PRINT_EVERY <= 1) || ((call_id % (uint64_t)MATRIX_KERNEL_DEBUG_PRINT_EVERY) == 0)) {

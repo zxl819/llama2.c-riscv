@@ -457,7 +457,10 @@ RV_BARE_CLANG_VLEN_FLAGS ?= \
 ./matrix_kernel_noblk.o: matrix_kernel_noblk.c
 	$(RV_BARE_CLANG) --target=riscv64-unknown-elf -march=$(RV_BARE_CLANG_MARCH) -mabi=$(RV_MABI) -O1 -ffreestanding -nostdlib -static -mcmodel=medany -menable-experimental-extensions -I$(RV_BARE_INC) -c $< -o $@
 
-RV_BARE_EXTRA_OBJS += ./matrix_kernel_rvv_accum.o ./matrix_kernel_matmul.o ./uart.o ./matrix_kernel_noblk.o
+./matrix_kernel_noblk_CT.o: matrix_kernel_noblk_CT.c
+	$(RV_BARE_CLANG) --target=riscv64-unknown-elf -march=$(RV_BARE_CLANG_MARCH) -mabi=$(RV_MABI) -O1 -ffreestanding -nostdlib -static -mcmodel=medany -menable-experimental-extensions -I$(RV_BARE_INC) -c $< -o $@
+
+RV_BARE_EXTRA_OBJS += ./matrix_kernel_rvv_accum.o ./matrix_kernel_matmul.o ./uart.o ./matrix_kernel_noblk.o ./matrix_kernel_noblk_CT.o
 
 rvbareclang: $(RV_BARE_APP_SRC) $(RV_BARE_BLOB_OBJS) $(RV_BARE_EXTRA_OBJS) | $(BARE_BUILD_DIR)
 	$(RV_BARE_CLANG) --target=riscv64-unknown-elf \
