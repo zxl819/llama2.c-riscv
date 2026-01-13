@@ -107,7 +107,7 @@ void matrix_kernel_qmatmul_f32_noblk_batch(float *xout,
         // Result: d x batch .
         (void)matrix_kernel_matmul_i8_i32_abt(x_pack, w_pack, c_pack, batch, d, count);
         debug_delay_cycles(2000);
-        __asm__ volatile("fence rw, rw" ::: "memory");
+        //__asm__ volatile("fence rw, rw" ::: "memory");
 
         // Prepare ws_local for this group (shared across batches)
         __attribute__((aligned(64))) float ws_local[d];

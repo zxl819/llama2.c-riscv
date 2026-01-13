@@ -1317,6 +1317,13 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     // using the Matrix-Matrix multiplication optimization.
     if (num_prompt_tokens > 1) {
         transformer_prefill(transformer, prompt_tokens, num_prompt_tokens - 1);
+        // add print
+        for (int i = 0; i < num_prompt_tokens - 1; i++) {
+            int p_token = prompt_tokens[i];
+            int prev_p_token = (i == 0) ? 1 : prompt_tokens[i-1];
+            char* piece = decode(tokenizer, prev_p_token, p_token);
+            safe_printf(piece); 
+        }
         pos = num_prompt_tokens - 1;
         token = prompt_tokens[pos];
     }
