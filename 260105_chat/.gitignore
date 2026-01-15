@@ -3,3 +3,8 @@ build/
 
 # Optional: ignore generated binary files
 *.bin
+performance/.venv
+*.xlsx
+*.pptx
+*.bin
+build/
