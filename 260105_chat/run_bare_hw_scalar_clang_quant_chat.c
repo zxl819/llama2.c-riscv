@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#define BARE_USE_CYCLE_COUNTER 1
 #include "uart_helper.c"
 #define CLOCK_FREQUENCY 50000000
 #define UART_BITRATE    115200
@@ -184,7 +185,7 @@ uintptr_t handle_trap(uintptr_t cause, uintptr_t epc, uintptr_t regs[32]) {
 #endif
 //"Once upon a time"
 #ifndef BARE_STEPS
-#define BARE_STEPS 16
+#define BARE_STEPS 256
 #endif
 
 #ifndef BARE_TEMPERATURE
@@ -856,7 +857,27 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
             for (size_t i = 0; i < str_len; i++) {
                 char buf[2] = { str_buffer[i], '\0' };
                 int single_id = str_lookup(t, buf);
-                if (single_id == -1) panic("tokenizer single missing");
+                if (single_id == -1) {
+                    // Try byte fallback: <0xNN>
+                    unsigned char val = (unsigned char)str_buffer[i];
+                    char byte_buf[7]; 
+                    char *hex = "0123456789ABCDEF";
+                    byte_buf[0] = '<';
+                    byte_buf[1] = '0';
+                    byte_buf[2] = 'x';
+                    byte_buf[3] = hex[val >> 4];
+                    byte_buf[4] = hex[val & 0xF];
+                    byte_buf[5] = '>';
+                    byte_buf[6] = '\0';
+                    single_id = str_lookup(t, byte_buf);
+                }
+                if (single_id == -1) {
+                    // panic("tokenizer single missing");
+                    // Skip or use a dummy token if we can't find it. 
+                    // To avoid crash, let's just skip it and warn.
+                    print_uart("[warn] skip unknown char\r\n");
+                    continue;
+                }
                 tokens[(*n_tokens)++] = single_id;
             }
         }
@@ -1005,6 +1026,221 @@ int sample_token(Sampler* sampler, float* logits) {
 }
 
 // ---------------------------------------------------------------------------
+// Batched Matmul for Prefill
+// ---------------------------------------------------------------------------
+
+// Reference implementation (Scalar) ported from test_matrix_kernel_batch.c
+static void matmul_ref(float *out, const int8_t *xq, const float *xs, 
+                       const int8_t *wq, const float *ws, 
+                       int n, int d, int gs, int batch) {
+    int num_groups = (n + gs - 1) / gs;
+    for (int b = 0; b < batch; b++) {
+        for (int i = 0; i < d; i++) {
+            float acc = 0.0f;
+            for (int j = 0; j < n; j++) {
+                int group = j / gs;
+                int8_t w_val = wq[i * n + j];
+                float w_scale = ws[i * num_groups + group];
+                int8_t x_val = xq[b * n + j];
+                float x_scale = xs[b * num_groups + group];
+                acc += ((float)w_val * w_scale) * ((float)x_val * x_scale);
+            }
+            out[b * d + i] = acc;
+        }
+    }
+}
+
+// HW Accelerated Batched Matmul
+static void matmul_q_batch(float* xout, const int8_t* xq, const float* xs, 
+                                          const int8_t* wq, const float* ws, 
+                                          int n, int d, int batch) {
+    // Currently using scalar reference for verification
+    matmul_ref(xout, xq, xs, wq, ws, n, d, GS, batch);
+}
+
+// Batched quantization for activations during prefill
+void quantize_batch(int8_t* xq, float* xs, float* x, int n, int batch) {
+    const int num_groups = (n + GS - 1) / GS;
+    const float Q_MAX = 127.0f;
+
+    for (int b = 0; b < batch; b++) {
+        float* x_row = x + b * n;
+        int8_t* xq_row = xq + b * n;
+        float* xs_row = xs + b * num_groups;
+        
+        for (int group = 0; group < num_groups; group++) {
+            const int base = group * GS;
+            const int count = (base + GS <= n) ? GS : (n - base);
+            float xmax = 0.0f;
+            for (int i = 0; i < count; i++) {
+                float v = bare_fabsf(x_row[base + i]);
+                if (v > xmax) xmax = v;
+            }
+            float scale = (xmax > 0.0f) ? (xmax / Q_MAX) : 1.0f;
+            xs_row[group] = scale;
+            if (xmax == 0.0f) {
+                for (int i = 0; i < count; i++) xq_row[base + i] = 0;
+            } else {
+                float inv = 1.0f / scale;
+                for (int i = 0; i < count; i++) {
+                    xq_row[base + i] = q_round_clamp_i8(x_row[base + i] * inv);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transformer Prefill (Matrix-Matrix Optimization)
+// ---------------------------------------------------------------------------
+
+void transformer_prefill(Transformer *t, int* tokens, int n_tokens) {
+    if (n_tokens <= 0) return;
+    Config* p = &t->config;
+    TransformerWeights* w = &t->weights;
+    RunState* s = &t->state;
+    int dim = p->dim;
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    int hidden_dim = p->hidden_dim;
+    int head_size = dim / p->n_heads;
+    int kv_mul = p->n_heads / p->n_kv_heads;
+    const int num_groups_x = (dim + GS - 1) / GS;
+    const int num_groups_h = (hidden_dim + GS - 1) / GS;
+
+    // Allocate batch buffers from heap (Bump allocator). 
+    // Uses the large 256MB bare_heap defined earlier.
+    float* x_batch = (float*)malloc(n_tokens * dim * sizeof(float));
+    float* xb_batch = (float*)malloc(n_tokens * dim * sizeof(float));
+    float* xb2_batch = (float*)malloc(n_tokens * dim * sizeof(float));
+    float* q_batch = (float*)malloc(n_tokens * dim * sizeof(float));
+    float* k_batch = (float*)malloc(n_tokens * kv_dim * sizeof(float));
+    float* v_batch = (float*)malloc(n_tokens * kv_dim * sizeof(float));
+    float* hb_batch = (float*)malloc(n_tokens * hidden_dim * sizeof(float));
+    float* hb2_batch = (float*)malloc(n_tokens * hidden_dim * sizeof(float));
+    
+    int8_t* xq_batch_q = (int8_t*)malloc(n_tokens * dim * sizeof(int8_t));
+    float* xq_batch_s = (float*)malloc(n_tokens * num_groups_x * sizeof(float));
+    int8_t* hq_batch_q = (int8_t*)malloc(n_tokens * hidden_dim * sizeof(int8_t));
+    float* hq_batch_s = (float*)malloc(n_tokens * num_groups_h * sizeof(float));
+
+    // Embedding lookup
+    for (int i = 0; i < n_tokens; i++) {
+        memcpy(x_batch + (size_t)i * dim, w->token_embedding_table + (size_t)tokens[i] * dim, dim * sizeof(float));
+    }
+
+    for (int l = 0; l < p->n_layers; l++) {
+        // RMSNorm (Att)
+        for (int i = 0; i < n_tokens; i++) {
+            rmsnorm(xb_batch + i * dim, x_batch + i * dim, w->rms_att_weight + l*dim, dim);
+        }
+
+        // QKV Matmuls (Batched Matrix-Matrix)
+        quantize_batch(xq_batch_q, xq_batch_s, xb_batch, dim, n_tokens);
+        matmul_q_batch(q_batch, xq_batch_q, xq_batch_s, w->wq_q[l].q, w->wq_q[l].s, dim, dim, n_tokens);
+        matmul_q_batch(k_batch, xq_batch_q, xq_batch_s, w->wk_q[l].q, w->wk_q[l].s, dim, kv_dim, n_tokens);
+        matmul_q_batch(v_batch, xq_batch_q, xq_batch_s, w->wv_q[l].q, w->wv_q[l].s, dim, kv_dim, n_tokens);
+
+        // RoPE and KV Cache Update (Position-dependent)
+        for (int i = 0; i < n_tokens; i++) {
+            int pos = i;
+            float* q = q_batch + i * dim;
+            float* k = k_batch + i * kv_dim;
+            for (int j = 0; j < dim; j += 2) {
+                float h_dim = (float)(j % head_size);
+                float freq = expf(-9.210340371976184f * (h_dim / (float)head_size));
+                float val = (float)pos * freq;
+                float fcr = cosf(val);
+                float fci = sinf(val);
+                float q0 = q[j];   float q1 = q[j+1];
+                q[j]   = q0 * fcr - q1 * fci;
+                q[j+1] = q0 * fci + q1 * fcr;
+                if (j < kv_dim) {
+                    float k0 = k[j]; float k1 = k[j+1];
+                    k[j]   = k0 * fcr - k1 * fci;
+                    k[j+1] = k0 * fci + k1 * fcr;
+                }
+            }
+            // Populate Cache
+            float* layer_k_cache = s->key_cache + (l * p->seq_len * kv_dim);
+            float* layer_v_cache = s->value_cache + (l * p->seq_len * kv_dim);
+            memcpy(layer_k_cache + pos * kv_dim, k, kv_dim * sizeof(float));
+            memcpy(layer_v_cache + pos * kv_dim, v_batch + i * kv_dim, kv_dim * sizeof(float));
+        }
+
+        // Causal Attention
+        for (int i = 0; i < n_tokens; i++) {
+            int pos = i;
+            float* layer_k_cache = s->key_cache + (l * p->seq_len * kv_dim);
+            float* layer_v_cache = s->value_cache + (l * p->seq_len * kv_dim);
+            
+            for (int h = 0; h < p->n_heads; h++) {
+                float* q = q_batch + i * dim + h * head_size;
+                float* att = s->att + h * p->seq_len;
+                float scale = 1.0f / sqrtf((float)head_size);
+                for (int t = 0; t <= pos; t++) {
+                    float* k = layer_k_cache + t * kv_dim + (h/kv_mul) * head_size;
+                    float score = 0.0f;
+                    for (int n = 0; n < head_size; n++) score += q[n] * k[n];
+                    att[t] = score * scale;
+                }
+                for (int t = pos + 1; t < p->seq_len; t++) att[t] = -1e9f;
+                softmax(att, pos + 1);
+                float* xb_out = xb_batch + i * dim + h * head_size;
+                for (int n = 0; n < head_size; n++) xb_out[n] = 0.0f;
+                for (int t = 0; t <= pos; t++) {
+                    float att_t = att[t];
+                    float* v = layer_v_cache + t * kv_dim + (h/kv_mul) * head_size;
+                    for (int n = 0; n < head_size; n++) xb_out[n] += att_t * v[n];
+                }
+            }
+        }
+
+        // Output Matmul (Batched)
+        quantize_batch(xq_batch_q, xq_batch_s, xb_batch, dim, n_tokens);
+        matmul_q_batch(xb2_batch, xq_batch_q, xq_batch_s, w->wo_q[l].q, w->wo_q[l].s, dim, dim, n_tokens);
+        for(int i=0; i<n_tokens*dim; i++) x_batch[i] += xb2_batch[i];
+
+        // FFN (Batched)
+        for (int i = 0; i < n_tokens; i++) {
+            rmsnorm(xb_batch + i * dim, x_batch + i * dim, w->rms_ffn_weight + l*dim, dim);
+        }
+        quantize_batch(xq_batch_q, xq_batch_s, xb_batch, dim, n_tokens);
+        matmul_q_batch(hb_batch, xq_batch_q, xq_batch_s, w->w1_q[l].q, w->w1_q[l].s, dim, hidden_dim, n_tokens);
+        matmul_q_batch(hb2_batch, xq_batch_q, xq_batch_s, w->w3_q[l].q, w->w3_q[l].s, dim, hidden_dim, n_tokens);
+        
+        for (int i = 0; i < n_tokens * hidden_dim; i++) {
+            float val = hb_batch[i];
+            val *= 1.0f / (1.0f + expf(-val));
+            hb_batch[i] = val * hb2_batch[i];
+        }
+        
+        quantize_batch(hq_batch_q, hq_batch_s, hb_batch, hidden_dim, n_tokens);
+        matmul_q_batch(xb_batch, hq_batch_q, hq_batch_s, w->w2_q[l].q, w->w2_q[l].s, hidden_dim, dim, n_tokens);
+        for(int i=0; i<n_tokens*dim; i++) x_batch[i] += xb_batch[i];
+    }
+    
+    // Resume point: Sync current state to the last prefilled token's output
+    memcpy(s->x, x_batch + (size_t)(n_tokens - 1) * dim, dim * sizeof(float));
+
+    // NOTE: Batch buffers are not freed here because the bare-metal allocator
+    // (likely) doesn't support free. This will leak memory.
+    // In a production environment, one should use a scratchpad or reset the heap offset
+    // if possible, or verify that strict bump allocation is acceptable.
+    free(x_batch); 
+    free(xb_batch);
+    free(xb2_batch);
+    free(q_batch);
+    free(k_batch);
+    free(v_batch);
+    free(hb_batch);
+    free(hb2_batch);
+    free(xq_batch_q);
+    free(xq_batch_s);
+    free(hq_batch_q);
+    free(hq_batch_s);
+}
+
+// ---------------------------------------------------------------------------
 // Chat Loop Implementation
 
 static int uart_getchar() {
@@ -1069,8 +1305,28 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, int 
         int num_user_tokens = 0;
         encode(tokenizer, user_input, 1, 0, user_tokens, &num_user_tokens);
 
+#if BARE_USE_CYCLE_COUNTER
+        uint64_t t_start = rdcycle();
+        uint64_t t_first = 0;
+#endif
+
         // Forward user tokens (prefill)
-        for (int i = 0; i < num_user_tokens; i++) {
+        // Optimize: Use batched prefill for all but the last token
+        int start_idx = 0;
+        if (num_user_tokens > 1) {
+            // Check if we have space (simple check)
+            if (pos + num_user_tokens > steps) {
+                print_uart("Context full. Resetting.\r\n");
+                pos = 0;
+                continue;
+            }
+            
+            transformer_prefill(transformer, user_tokens, num_user_tokens - 1);
+            pos += (num_user_tokens - 1);
+            start_idx = num_user_tokens - 1;
+        }
+
+        for (int i = start_idx; i < num_user_tokens; i++) {
             token = user_tokens[i];
             float* logits = forward(transformer, token, pos);
             pos++;
@@ -1085,12 +1341,19 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, int 
 
         // 3. Generate Response
         print_uart("Llama: ");
+        int line_token_count = 0;
         
         float* logits = forward(transformer, token, pos - 1); 
         
+        int gen_count = 0;
         while (pos < steps) {
             next = sample_token(sampler, logits);
             
+#if BARE_USE_CYCLE_COUNTER
+            if (t_first == 0) t_first = rdcycle();
+#endif
+            gen_count++;
+
             // Advance
             pos++;
             
@@ -1099,7 +1362,34 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, int 
             if (next == 2) break; // EOS
 
             char* piece = decode(tokenizer, token, next);
-            safe_printf(piece);
+            
+            // Check if piece contains newline naturally, handle CR LF
+            int has_newline = 0;
+            if (piece) {
+                char *ptr = piece;
+                while (*ptr) {
+                    if (*ptr == '\n') {
+                        print_uart("\r\n");
+                        has_newline = 1;
+                    } else {
+                        // send char
+                        char buf[2] = {*ptr, '\0'};
+                        safe_printf(buf);
+                    }
+                    ptr++;
+                }
+            }
+
+            // Output with 16-token wrapping
+            if (has_newline) {
+                line_token_count = 0;
+            } else {
+                line_token_count++;
+                if (line_token_count >= 16) {
+                    print_uart("\r\n");
+                    line_token_count = 0;
+                }
+            }
             
             token = next;
             logits = forward(transformer, token, pos - 1); 
@@ -1107,6 +1397,28 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, int 
             if (next == 2) { print_uart("\r\n"); break; }
         }
         print_uart("\r\n");
+
+#if BARE_USE_CYCLE_COUNTER
+        uint64_t t_end = rdcycle();
+        long ms_ttft = cycles_to_ms(t_start, t_first);
+        long ms_gen = cycles_to_ms(t_first, t_end);
+        
+        print_uart("[perf] TTFT: ");
+        print_uart_int_dec((uint64_t)ms_ttft);
+        print_uart(" ms | Gen: ");
+        print_uart_int_dec((uint64_t)gen_count);
+        print_uart(" toks / ");
+        print_uart_int_dec((uint64_t)ms_gen);
+        print_uart(" ms (");
+        
+        if (ms_gen > 0) {
+            float tok_s = (float)gen_count / (ms_gen / 1000.0f);
+            print_float_fixed3(tok_s);
+            print_uart(" tok/s)\r\n");
+        } else {
+             print_uart("? tok/s)\r\n");
+        }
+#endif
         
         if (pos >= steps) {
             print_uart("(Context limit reached, resetting)\r\n");

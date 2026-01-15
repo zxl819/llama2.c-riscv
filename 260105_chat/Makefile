@@ -342,21 +342,21 @@ matrixobjs: $(MATRIX_OBJS)
 .PHONY: rvbare
 rvbare: $(RV_BARE_APP_SRC) $(RV_BARE_BLOB_OBJS) $(RV_BARE_EXTRA_OBJS) | $(BARE_BUILD_DIR)
 	$(RVCC) $(RV_BARE_CFLAGS) $(RV_BARE_CRT) $(RV_BARE_SYSC) $(RV_BARE_APP_SRC) \
-		$(RV_BARE_BLOB_OBJS) $(RV_BARE_EXTRA_OBJS) $(RV_BARE_EXTRA_LIBS) -lgcc -o $(RV_BARE_NAME).elf
-	$(RVOBJCOPY) -O binary $(RV_BARE_NAME).elf $(RV_BARE_NAME).bin
+		$(RV_BARE_BLOB_OBJS) $(RV_BARE_EXTRA_OBJS) $(RV_BARE_EXTRA_LIBS) -lgcc -o $(BARE_BUILD_DIR)/$(RV_BARE_NAME).elf
+	$(RVOBJCOPY) -O binary $(BARE_BUILD_DIR)/$(RV_BARE_NAME).elf $(BARE_BUILD_DIR)/$(RV_BARE_NAME).bin
 
 .PHONY: rvbarenostrip
 rvbarenostrip: $(RV_BARE_APP_SRC) $(RV_BARE_BLOB_OBJS) $(RV_BARE_EXTRA_OBJS) | $(BARE_BUILD_DIR)
 	$(RVCC) $(RV_BARE_CFLAGS_NOSTRIP) $(RV_BARE_CRT) $(RV_BARE_SYSC) $(RV_BARE_APP_SRC) \
-		$(RV_BARE_BLOB_OBJS) $(RV_BARE_EXTRA_OBJS) $(RV_BARE_EXTRA_LIBS) -lgcc -o $(RV_BARE_NAME).elf
-	$(RVOBJCOPY) -O binary $(RV_BARE_NAME).elf $(RV_BARE_NAME).bin
+		$(RV_BARE_BLOB_OBJS) $(RV_BARE_EXTRA_OBJS) $(RV_BARE_EXTRA_LIBS) -lgcc -o $(BARE_BUILD_DIR)/$(RV_BARE_NAME).elf
+	$(RVOBJCOPY) -O binary $(BARE_BUILD_DIR)/$(RV_BARE_NAME).elf $(BARE_BUILD_DIR)/$(RV_BARE_NAME).bin
 
 .PHONY: rvbarechat
 
 rvbarechat: $(RV_BARE_BLOB_OBJS) | $(BARE_BUILD_DIR)
 	$(RVCC) $(RV_BARE_CFLAGS) $(RV_BARE_CRT) $(RV_BARE_SYSC) run_bare_chat.c \
-		$(RV_BARE_BLOB_OBJS) $(RV_BARE_EXTRA_OBJS) $(RV_BARE_EXTRA_LIBS) -lgcc -o run_bare_chat.elf
-	$(RVOBJCOPY) -O binary run_bare_chat.elf run_bare_chat.bin
+		$(RV_BARE_BLOB_OBJS) $(RV_BARE_EXTRA_OBJS) $(RV_BARE_EXTRA_LIBS) -lgcc -o $(BARE_BUILD_DIR)/run_bare_chat.elf
+	$(RVOBJCOPY) -O binary $(BARE_BUILD_DIR)/run_bare_chat.elf $(BARE_BUILD_DIR)/run_bare_chat.bin
 
 SPK_BARE_FLAGS ?= --isa=$(RV_MARCH)
 
@@ -374,17 +374,17 @@ SPK_BARE_ALL_ARGS ?= $(SPK_BARE_FLAGS) $(SPK_BARE_LOG_ARGS) $(SPK_BARE_SIG_ARGS)
 .PHONY: rvrunbare
 rvrunbare: rvbare
 	@mkdir -p $(BARE_BUILD_DIR)
-	$(SPK) $(SPK_BARE_ALL_ARGS) ./$(RV_BARE_NAME).elf $(SPK_BARE_POST)
+	$(SPK) $(SPK_BARE_ALL_ARGS) ./$(BARE_BUILD_DIR)/$(RV_BARE_NAME).elf $(SPK_BARE_POST)
 
 .PHONY: rvrunbarechat
 rvrunbarechat: rvbarechat
 	@mkdir -p $(BARE_BUILD_DIR)
-	$(SPK) $(SPK_BARE_ALL_ARGS) ./run_bare_chat.elf $(SPK_BARE_POST)
+	$(SPK) $(SPK_BARE_ALL_ARGS) ./$(BARE_BUILD_DIR)/run_bare_chat.elf $(SPK_BARE_POST)
 
 .PHONY: rvrunbarenostrip
 rvrunbarenostrip: rvbarenostrip
 	@mkdir -p $(BARE_BUILD_DIR)
-	$(SPK) $(SPK_BARE_ALL_ARGS) ./$(RV_BARE_NAME).elf $(SPK_BARE_POST)
+	$(SPK) $(SPK_BARE_ALL_ARGS) ./$(BARE_BUILD_DIR)/$(RV_BARE_NAME).elf $(SPK_BARE_POST)
 
 $(BARE_BUILD_DIR):
 	mkdir -p $@
@@ -421,13 +421,13 @@ $(BARE_TOKENIZER_OBJ): $(BARE_BUILD_DIR)/tokenizer_blob.S | $(BARE_BUILD_DIR)
 
 .PHONY: cleanrvbare
 cleanrvbare:
-	rm -f $(RV_BARE_NAME).elf $(RV_BARE_NAME).bin $(RV_BARE_NAME).dump
-	rm -f run_bare_chat.elf run_bare_chat.bin run_bare_chat.dump
+	rm -f $(BARE_BUILD_DIR)/$(RV_BARE_NAME).elf $(BARE_BUILD_DIR)/$(RV_BARE_NAME).bin $(BARE_BUILD_DIR)/$(RV_BARE_NAME).dump
+	rm -f $(BARE_BUILD_DIR)/run_bare_chat.elf $(BARE_BUILD_DIR)/run_bare_chat.bin $(BARE_BUILD_DIR)/run_bare_chat.dump
 	rm -rf $(BARE_BUILD_DIR)
 
 .PHONY: rvbarenm
 rvbarenm:
-	$(RISCV_PREFIX)-nm -C $(RV_BARE_NAME).elf | grep -E 'tohost|fromhost' || true
+	$(RISCV_PREFIX)-nm -C $(BARE_BUILD_DIR)/$(RV_BARE_NAME).elf | grep -E 'tohost|fromhost' || true
 
 
 # Bare-metal linking using clang as the driver (kept as a convenience target).
@@ -451,7 +451,7 @@ RV_BARE_CLANG_VLEN_FLAGS ?= \
 ./matrix_kernel_matmul.o: matrix_kernel_matmul.c
 	$(RV_BARE_CLANG) --target=riscv64-unknown-elf -march=$(RV_BARE_CLANG_MARCH) -mabi=$(RV_MABI) -O1 -g -mcmodel=medany -I$(RV_BARE_INC) -I/mnt/d/riscv-dnn/include -I/mnt/d/riscv-dnn/test/ops/matmul_llama -DRVDNN_FORCE_STUB_MATRIX=1 -c $< -o $@
 
-./uart.o: ../uart.c
+./uart.o: ./uart.c
 	$(RV_BARE_CLANG) --target=riscv64-unknown-elf -march=$(RV_BARE_CLANG_MARCH) -mabi=$(RV_MABI) -O1 -ffreestanding -nostdlib -static -mcmodel=medany -menable-experimental-extensions -I$(RV_BARE_INC) -c $< -o $@
 
 ./matrix_kernel_noblk.o: matrix_kernel_noblk.c
@@ -476,16 +476,16 @@ rvbareclang: $(RV_BARE_APP_SRC) $(RV_BARE_BLOB_OBJS) $(RV_BARE_EXTRA_OBJS) | $(B
 	$(RV_BARE_BLOB_DEFS) \
 	$(RV_BARE_CRT) $(RV_BARE_SYSC) $(RV_BARE_APP_SRC) \
 	$(RV_BARE_BLOB_OBJS) $(RV_BARE_EXTRA_OBJS) $(RV_BARE_EXTRA_LIBS) \
-	-lgcc -o $(RV_BARE_NAME).elf
-	$(RVOBJCOPY) -O binary $(RV_BARE_NAME).elf $(RV_BARE_NAME).bin
+	-lgcc -o $(BARE_BUILD_DIR)/$(RV_BARE_NAME).elf
+	$(RVOBJCOPY) -O binary $(BARE_BUILD_DIR)/$(RV_BARE_NAME).elf $(BARE_BUILD_DIR)/$(RV_BARE_NAME).bin
 rvrunbareclang: rvbareclang
-	$(SPK) $(SPK_BARE_ALL_ARGS) ./$(RV_BARE_NAME).elf $(SPK_BARE_POST)
+	$(SPK) $(SPK_BARE_ALL_ARGS) ./$(BARE_BUILD_DIR)/$(RV_BARE_NAME).elf $(SPK_BARE_POST)
 
 # dump file generation
 dump: $(target_dump)
-target_dump = $(RV_BARE_NAME).dump
-$(target_dump): ./$(RV_BARE_NAME).elf
-	$(RVOBJDUMP) -S ./$(RV_BARE_NAME).elf > $(target_dump)
+target_dump = $(BARE_BUILD_DIR)/$(RV_BARE_NAME).dump
+$(target_dump): ./$(BARE_BUILD_DIR)/$(RV_BARE_NAME).elf
+	$(RVOBJDUMP) -S ./$(BARE_BUILD_DIR)/$(RV_BARE_NAME).elf > $(target_dump)
 # Convenience target to show current configuration
 .PHONY: rvinfo
 rvinfo:

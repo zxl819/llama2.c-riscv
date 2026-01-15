@@ -16,7 +16,7 @@
 // #include "matrix_kernel_noblk.h"
 #include "matrix_kernel_1230.h"
 #include "matrix_kernel_noblk_1231.h"
-#define CLOCK_FREQUENCY 50000000
+#define CLOCK_FREQUENCY 1000000000
 #define UART_BITRATE    115200
 
 // Keep -O1 for the overall build, but prevent Clang from auto-vectorizing

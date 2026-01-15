@@ -15,8 +15,7 @@ def parse_performance_log(file_path):
     
     # 定义正则表达式匹配模式
     # 格式: [prof] token <pos> <name> <dims>: <cycles> cycles (<ms> ms)
-    # 支持负数 token_pos（如 -1 表示 encode）以及字母字符串
-    pattern = r'\[prof\] token (-?\d+|[\w]+)\s+([\w_]+)\s*(?:\(([\d,]+)\))?\s*:\s*(\d+)\s+cycles\s+\((\d+(?:\.\d+)?)\s+ms\)'
+    pattern = r'\[prof\] token (\d+|[\w]+)\s+([\w_]+)\s*(?:\(([\d,]+)\))?\s*:\s*(\d+)\s+cycles\s+\((\d+(?:\.\d+)?)\s+ms\)'
     
     # 辅助变量
     current_token = None
@@ -199,7 +198,7 @@ def apply_excel_formatting(file_path):
 
 def main():
     # 输入文件路径
-    input_file = 'performance_layer_debug4.txt'
+    input_file = 'performance_layer_debug9_matrix_prefillO1.txt'
     
     # 检查文件是否存在
     if not os.path.exists(input_file):
@@ -207,7 +206,7 @@ def main():
         return
     
     # 输出文件路径
-    output_file = 'performance_analysis_matrix_debug4.xlsx'
+    output_file = 'performance_analysis_matrix_debug9_prefill.xlsx'
     
     print("开始解析性能日志文件...")
     
