@@ -1,0 +1,5 @@
+# Ignore build artifact directory
+build/
+
+# Optional: ignore generated binary files
+*.bin
