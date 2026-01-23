@@ -4,8 +4,29 @@
 #include <riscv_vector.h>
 #include <stdint.h>
 #include <stddef.h>
+#include "RVV_padding.c"
+//#include "uart_helper.c"
 
-static inline void softmax(float* x, int size) {
+// These UART helpers are provided by the including translation unit in bare-metal builds.
+// They must be visible before this header uses them (C99 forbids implicit declarations).
+void print_uart(const char *str);
+void print_uart_float(float val);
+
+static inline void debug_delay_cycles(unsigned cycles) {
+    for (unsigned i = 0; i < cycles; ++i) {
+        asm volatile("nop");
+    }
+}
+
+static inline void safe_vse32_f32m1(float *dst, vfloat32m1_t v, size_t vl) {
+    __riscv_vse32_v_f32m1(dst, v, vl);
+    debug_delay_cycles(100);
+}
+// ---------------------------------------------------------------------------
+
+static inline void softmax_vec(float* x, int size) {
+    // init_uart(CLOCK_FREQUENCY, UART_BITRATE); // Removing repeated init which might cause hangs
+    //print_uart("Enter the softmax.\r\n");
     float* dst = x;
     float* src = x;
     size_t n = size;
@@ -89,10 +110,11 @@ static inline void softmax(float* x, int size) {
     vredmax = __riscv_vfredmax_vs_f32m1_f32m1(vmax, vredmax, vlmax);
 
     // 通过内存获取 max_x，避免标量浮点寄存器
-    uint32_t max_x_bits[1];
+    uint32_t max_x_bits[32] __attribute__((aligned(64))); // Increased size for safety (VLEN coverage)
+
     vuint32m1_t vredmax_int = __riscv_vreinterpret_v_f32m1_u32m1(vredmax);
     __riscv_vse32_v_u32m1(max_x_bits, vredmax_int, 1);
-    
+
     union { uint32_t u; float f; } max_x_union = {.u = max_x_bits[0]};
     uint32_t max_x_as_int = max_x_union.u;
 
@@ -166,8 +188,11 @@ static inline void softmax(float* x, int size) {
     corr  = __riscv_vfnmsac_vv_f32m1(vtwo1, vsum1_eps, vinv1, vl1);
     vinv1 = __riscv_vfmul_vv_f32m1(vinv1, corr, vl1);
     // 1. 先把单元素倒数 vinv1 写到 inv_table
-    uint32_t inv_table[1];
+    uint32_t inv_table[32] __attribute__((aligned(64))); // Increased size for safety
+
     __riscv_vse32_v_u32m1(inv_table, __riscv_vreinterpret_v_f32m1_u32m1(vinv1), 1);
+
+
     // 2. 构造单元素向量
     vfloat32m1_t inv_vec = __riscv_vreinterpret_v_u32m1_f32m1(
     __riscv_vle32_v_u32m1(inv_table, 1));
@@ -188,6 +213,160 @@ static inline void softmax(float* x, int size) {
         avl3 -= vl;
         dst  += vl;
     }
+    debug_delay_cycles(500000);
+    //print_uart("End the softmax. \r\n");
+    // if (canary1 != 0xDEADBEEF) print_uart("PANIC: Stack Corruption (canary1 at exit)!\r\n");
+    // if (canary2 != 0xCAFEBABE) print_uart("PANIC: Stack Corruption (canary2 at exit)!\r\n");
+    // if (canary3 != 0xBAADF00D) print_uart("PANIC: Stack Corruption (canary3 at exit)!\r\n");
+    // if (canary4 != 0xFEEDFACE) print_uart("PANIC: Stack Corruption (canary4 at exit)!\r\n");
+    // print_uart("Softmax returning...\r\n");
 }
+
+static inline void element_add(float* x, float* y, int size) {
+    size_t avl = size;
+    float* ptr_x = x;
+    float* ptr_y = y;
+    while (avl > 0) {
+        size_t vl = __riscv_vsetvl_e32m1(avl);
+        vfloat32m1_t vx = __riscv_vle32_v_f32m1(ptr_x, vl);
+        vfloat32m1_t vy = __riscv_vle32_v_f32m1(ptr_y, vl);
+        vfloat32m1_t vres = __riscv_vfadd_vv_f32m1(vx, vy, vl);
+        __riscv_vse32_v_f32m1(ptr_x, vres, vl);
+        ptr_x += vl;
+        ptr_y += vl;
+        avl -= vl;
+    }
+}
+static void __attribute__((noinline)) matmul(float* xout, float* x, float* w, int n, int d) {
+    // Requirement: ensure input x length (n) and each W row length are multiples of 16.
+    // For RVV e32m1 with VLEN=512, vlmax is 16; using fixed vl=16 avoids tail handling.
+    if ((n & 15) != 0) {
+        print_uart("Error: matmul requires n % 16 == 0\r\n");
+        return;
+    }
+    if (n <= 0 || d <= 0) return;
+
+    const size_t vlmax = __riscv_vsetvlmax_e32m1();
+    const vfloat32m1_t vzero = __riscv_vreinterpret_v_u32m1_f32m1(
+        __riscv_vmv_v_x_u32m1(0u, vlmax));
+    const size_t vl1 = __riscv_vsetvl_e32m1(16);
+
+    for (int i = 0; i < d; i++) {
+        float* row_ptr = w + (size_t)i * (size_t)n;
+        float* x_ptr = x;
+
+        // Accumulate chunk sums in a 1-lane vector accumulator.
+        vfloat32m1_t vacc1 = vzero;
+
+        // n is guaranteed multiple of 16, so this loop has no tail.
+        for (int j = 0; j < n; j += 16) {
+            const size_t vl = __riscv_vsetvl_e32m1(16);
+            const vfloat32m1_t vrow = __riscv_vle32_v_f32m1(row_ptr, vl);
+            const vfloat32m1_t vx = __riscv_vle32_v_f32m1(x_ptr, vl);
+            const vfloat32m1_t vprod = __riscv_vfmul_vv_f32m1(vrow, vx, vl);
+            const vfloat32m1_t vblk = __riscv_vfredosum_vs_f32m1_f32m1(vprod, vzero, vl);
+            vacc1 = __riscv_vfadd_vv_f32m1(vacc1, vblk, vl1);
+            row_ptr += 16;
+            x_ptr += 16;
+        }
+
+        __riscv_vse32_v_f32m1(&xout[i], vacc1, vl1);
+        debug_delay_cycles(10);
+    }
+}
+static inline void matmul_vector(float* xout, float* x, float* w, int n, int d) {
+    static float debug_capture[2048] __attribute__((aligned(64)));
+    static int debug_captured = 0;
+    static int capture_idx = 0;
+    size_t vlmax = __riscv_vsetvlmax_e32m1();
+    //vfloat32m1_t vzero = __riscv_vfmv_v_f_f32m1(0.0f, vlmax);
+    vfloat32m1_t vzero   = __riscv_vreinterpret_v_u32m1_f32m1(__riscv_vmv_v_x_u32m1(0u,        vlmax));
+    
+    // // 移到循环外，移除过度的对齐要求，避免栈指针动态调整带来的风险
+    static float temp[2048] __attribute__((aligned(64))); 
+    float temp2[32] __attribute__((aligned(64))); 
+
+
+    for (int i = 0; i < d; i++) {
+        float* row = w + i * n;
+        float* ptr_x = x;
+        
+        vfloat32m1_t vsum = vzero;
+        size_t avl = n;
+        float acc = 0.0f;
+        
+        while (avl > 0) {
+            size_t vl = __riscv_vsetvl_e32m1(avl);
+            vfloat32m1_t vrow = __riscv_vle32_v_f32m1(row, vl);
+            vfloat32m1_t vx = __riscv_vle32_v_f32m1(ptr_x, vl);
+
+            // Capture debug data safely (all chunks of first row)
+            if (i == 0 && !debug_captured) {
+                if (capture_idx + vl <= 2048) {
+                    __riscv_vse32_v_f32m1(&debug_capture[capture_idx], vx, vl);
+                    debug_delay_cycles(5);
+                    capture_idx += vl;
+                }
+            }
+
+            vfloat32m1_t vprod = __riscv_vfmul_vv_f32m1(vrow, vx, vl);
+            
+            vsum = __riscv_vfadd_vv_f32m1(vsum, vprod, vl);
+            // 创建掩码向量（全为1，表示更新所有元素）
+            // 使用掩码进行向量加法
+            //vsum = __riscv_vfadd_vv_f32m1_tu(mask, vsum, vprod, vl);
+            //vsum = __riscv_vfadd_vv_f32m1_tu(vsum, vsum, vprod, vl);
+
+            row += vl;
+            ptr_x += vl;
+            avl -= vl;
+        }
+        
+        if (i == 0 && !debug_captured) {
+            debug_captured = 1; // Mark capture finished
+        }
+        
+        // // 重置 vl 为 vlmax 以确保保存所有累加结果
+        size_t vl_store = __riscv_vsetvl_e32m1(vlmax);
+        
+        // // 使用栈上的临时数组暂存向量结果
+        // // 注意：不要使用 = {0} 初始化，这会导致隐式 memset 调用，可能破坏寄存器状态或导致栈异常
+        // //float temp[32] __attribute__((aligned(64)));
+        __riscv_vse32_v_f32m1(temp, vsum, vl_store);
+        
+        // // 关键修复：添加内存屏障，确保向量存储对标量加载可见
+        asm volatile("fence rw,rw" ::: "memory");
+        
+        debug_delay_cycles(50);
+        //float acc = 0.0f;
+        volatile float* vtemp = temp;
+        for (size_t j = 0; j < vl_store; j++) {
+            acc += vtemp[j];
+            //temp[j]=0; // Don't clear static temp, just overwrite next time
+        }
+        
+        xout[i] = acc;
+    }
+
+    if (debug_captured == 1) {
+        print_uart("Captured Vector Input (Full): ");
+        print_uart("\r\n");
+        for(int k=0; k<capture_idx; k++) {
+             print_uart_float(debug_capture[k]);
+             print_uart(" ");
+             if ((k + 1) % 7 == 0) print_uart("\r\n");
+        }
+        print_uart("\r\n");
+        debug_captured = 2; // Mark as printed
+    }
+    //debug_delay_cycles(5000);
+}
+
+
+static void __attribute__((noinline)) matmul_vector2(float* xout, float* x, float* w, int n, int d) {  
+    // Keep an alternate entry point, but make it allocation-free as well.
+    matmul(xout, x, w, n, d);
+}
+
 
 #endif

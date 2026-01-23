@@ -433,7 +433,7 @@ rvbarenm:
 # Bare-metal linking using clang as the driver (kept as a convenience target).
 RV_BARE_CLANG ?= ~/newllvm/test_llvm/build/bin/clang
 RV_BARE_CLANG_MARCH ?= $(RV_MARCH)
-RV_BARE_CLANG_O ?= -O1
+RV_BARE_CLANG_O ?= -O2
 # Extra flags for the clang driver (e.g. -menable-experimental-extensions).
 RV_BARE_CLANG_EXTRA_FLAGS ?=
 #clang
@@ -460,8 +460,11 @@ RV_BARE_CLANG_VLEN_FLAGS ?= \
 ./matrix_kernel_noblk_CT.o: matrix_kernel_noblk_CT.c
 	$(RV_BARE_CLANG) --target=riscv64-unknown-elf -march=$(RV_BARE_CLANG_MARCH) -mabi=$(RV_MABI) -O1 -ffreestanding -nostdlib -static -mcmodel=medany -menable-experimental-extensions -I$(RV_BARE_INC) -c $< -o $@
 
-RV_BARE_EXTRA_OBJS += ./matrix_kernel_rvv_accum.o ./matrix_kernel_matmul.o ./uart.o ./matrix_kernel_noblk.o ./matrix_kernel_noblk_CT.o
+# ./softmax_rvv.o: softmax_rvv.c
+# 	$(RV_BARE_CLANG) --target=riscv64-unknown-elf -march=$(RV_BARE_CLANG_MARCH) -mabi=$(RV_MABI) -O1 -ffreestanding -nostdlib -static -mcmodel=medany $(RV_BARE_CLANG_VLEN_FLAGS) -I$(RV_BARE_INC) -c $< -o $@
 
+RV_BARE_EXTRA_OBJS += ./matrix_kernel_rvv_accum.o ./matrix_kernel_matmul.o ./uart.o ./matrix_kernel_noblk.o ./matrix_kernel_noblk_CT.o 
+# ./softmax_rvv.o
 rvbareclang: $(RV_BARE_APP_SRC) $(RV_BARE_BLOB_OBJS) $(RV_BARE_EXTRA_OBJS) | $(BARE_BUILD_DIR)
 	$(RV_BARE_CLANG) --target=riscv64-unknown-elf \
 	-march=$(RV_BARE_CLANG_MARCH) \

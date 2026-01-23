@@ -1,0 +1,1060 @@
+// Bare-metal friendly inference harness for llama2.c
+// ---------------------------------------------------
+// This variant removes all host OS dependencies so the model can execute in a
+// freestanding Spike tohost/fromhost environment. The model and tokenizer
+// binaries are embedded directly into the ELF via objcopy; see the Makefile
+// rvbare target for how MODEL_BIN/TOKENIZER_BIN become linker symbols used here.
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+// --- UART Implementation from test.c ---
+#define UART_BASE 0x10000000
+#define UART_RBR (UART_BASE + 0)
+#define UART_THR (UART_BASE + 0)
+#define UART_INTERRUPT_ENABLE (UART_BASE + 4)
+#define UART_FIFO_CONTROL (UART_BASE + 8)
+#define UART_LINE_CONTROL (UART_BASE + 12)
+#define UART_MODEM_CONTROL (UART_BASE + 16)
+#define UART_LINE_STATUS (UART_BASE + 20)
+#define UART_DLAB_LSB (UART_BASE + 0)
+#define UART_DLAB_MSB (UART_BASE + 4)
+
+#define CLOCK_FREQUENCY 50000000
+#define UART_BITRATE    115200
+
+static void write_reg_u8(uintptr_t addr, uint8_t value) {
+    volatile uint8_t *loc_addr = (volatile uint8_t *)addr;
+    *loc_addr = value;
+}
+
+static uint8_t read_reg_u8(uintptr_t addr) {
+    return *(volatile uint8_t *)addr;
+}
+
+static int is_transmit_empty() {
+    return read_reg_u8(UART_LINE_STATUS) & 0x20;
+}
+
+static void write_serial(char a) {
+    while (is_transmit_empty() == 0) {};
+    write_reg_u8(UART_THR, a);
+}
+
+static void init_uart(uint32_t freq, uint32_t baud) {
+    uint32_t divisor = freq / (baud << 4);
+    write_reg_u8(UART_INTERRUPT_ENABLE, 0x00);
+    write_reg_u8(UART_LINE_CONTROL, 0x80);
+    write_reg_u8(UART_DLAB_LSB, divisor);
+    write_reg_u8(UART_DLAB_MSB, (divisor >> 8) & 0xFF);
+    write_reg_u8(UART_LINE_CONTROL, 0x03);
+    write_reg_u8(UART_FIFO_CONTROL, 0xC7);
+    write_reg_u8(UART_MODEM_CONTROL, 0x20);
+}
+
+static void print_uart(const char *str) {
+    const char *cur = &str[0];
+    while (*cur != '\0') {
+        write_serial((uint8_t)*cur);
+        ++cur;
+    }
+}
+
+// Helper for printing numbers (decimal)
+static void print_uart_int_dec(uint64_t val) {
+    char buf[32];
+    int i = 0;
+    if (val == 0) {
+        print_uart("0");
+        return;
+    }
+    while (val > 0) {
+        buf[i++] = (val % 10) + '0';
+        val /= 10;
+    }
+    for (int j = i - 1; j >= 0; j--) {
+        write_serial(buf[j]);
+    }
+}
+
+// Helper for printing floats (simple)
+static void print_uart_float(float val) {
+    if (val < 0) {
+        print_uart("-");
+        val = -val;
+    }
+    uint64_t int_part = (uint64_t)val;
+    float frac_part = val - int_part;
+    print_uart_int_dec(int_part);
+    print_uart(".");
+    uint64_t frac_int = (uint64_t)(frac_part * 1000000);
+    print_uart_int_dec(frac_int);
+}
+
+#include "riscv_vector_kernels.h"
+
+// ---------------------------------------------------------------------------
+// Tiny libc hooks provided by bare_syscalls.c (no system headers required)
+typedef long ssize_t;
+
+void *memcpy(void *dest, const void *src, size_t len);
+void *memset(void *dest, int byte, size_t len);
+int printf(const char *fmt, ...);
+void exit(int code);
+int strcmp(const char *s1, const char *s2);
+size_t strlen(const char *s);
+
+// ---------------------------------------------------------------------------
+// Build-time knobs (override via e.g. `make rvbare CFLAGS+=-DBARE_STEPS=128`)
+#ifndef BARE_PROMPT
+#define BARE_PROMPT "Once upon a time" 
+#endif
+//"Once upon a time"
+#ifndef BARE_STEPS
+#define BARE_STEPS 64
+#endif
+
+#ifndef BARE_TEMPERATURE
+#define BARE_TEMPERATURE 0.8f
+#endif
+
+#ifndef BARE_TOPP
+#define BARE_TOPP 0.9f
+#endif
+
+#ifndef BARE_SEED
+#define BARE_SEED 123456789ull
+#endif
+
+#ifndef BARE_HEAP_BYTES
+#define BARE_HEAP_BYTES (32 * 1024 * 1024)
+#endif
+
+#ifndef BARE_CPU_HZ
+#define BARE_CPU_HZ CLOCK_FREQUENCY
+#endif
+
+#ifndef BARE_USE_CYCLE_COUNTER
+#define BARE_USE_CYCLE_COUNTER 1
+#endif
+
+// ---------------------------------------------------------------------------
+// Embedded binary symbols (provided by objcopy in the Makefile)
+#ifndef MODEL_BIN_START
+#error "MODEL_BIN_START is not defined. See Makefile rvbare instructions."
+#endif
+#ifndef MODEL_BIN_END
+#error "MODEL_BIN_END is not defined. See Makefile rvbare instructions."
+#endif
+#ifndef TOKENIZER_BIN_START
+#error "TOKENIZER_BIN_START is not defined. See Makefile rvbare instructions."
+#endif
+#ifndef TOKENIZER_BIN_END
+#error "TOKENIZER_BIN_END is not defined. See Makefile rvbare instructions."
+#endif
+
+extern const unsigned char MODEL_BIN_START[];
+extern const unsigned char MODEL_BIN_END[];
+extern const unsigned char TOKENIZER_BIN_START[];
+extern const unsigned char TOKENIZER_BIN_END[];
+extern char _end[]; // Linker symbol for end of BSS (start of free memory/stack limit)
+
+static void check_stack_usage(const char* location) {
+    uintptr_t sp;
+    asm volatile("mv %0, sp" : "=r"(sp));
+    uintptr_t limit = (uintptr_t)_end;
+    // crt.S aligns _end to 64 bytes and adds some padding, but _end is the safe lower bound.
+    
+    // Print status
+    // print_uart("[STACK] @"); print_uart(location);
+    // print_uart(" SP:"); print_uart_int_dec(sp);
+    // print_uart(" Limit:"); print_uart_int_dec(limit);
+    // print_uart(" Free:"); print_uart_int_dec(sp - limit);
+    // print_uart("\r\n");
+
+    if (sp < limit + 2048) { // Warning if less than 2KB left
+        print_uart("\r\n!!! DANGER: STACK OVERFLOW IMMINENT !!!\r\n");
+        print_uart("Location: "); print_uart(location); print_uart("\r\n");
+        print_uart("SP: "); print_uart_int_dec(sp);
+        print_uart(" Limit: "); print_uart_int_dec(limit);
+        print_uart("\r\n");
+    }
+}
+
+static inline size_t embedded_model_size(void) {
+    return (size_t)(MODEL_BIN_END - MODEL_BIN_START);
+}
+
+static inline size_t embedded_tokenizer_size(void) {
+    return (size_t)(TOKENIZER_BIN_END - TOKENIZER_BIN_START);
+}
+
+// ---------------------------------------------------------------------------
+// Tiny bump allocator for bare-metal use
+static unsigned char bare_heap[BARE_HEAP_BYTES];
+static size_t bare_heap_offset = 0;
+
+static void panic(const char *msg) {
+    print_uart("[bare] PANIC: ");
+    print_uart(msg);
+    print_uart("\n");
+    exit(1);
+}
+
+static void *bare_alloc(size_t size, size_t alignment) {
+    if (alignment == 0) alignment = 8;
+    size_t misalignment = bare_heap_offset % alignment;
+    if (misalignment != 0) bare_heap_offset += alignment - misalignment;
+    if (bare_heap_offset + size > BARE_HEAP_BYTES) panic("bare heap exhausted");
+    void *ptr = &bare_heap[bare_heap_offset];
+    bare_heap_offset += size;
+    return ptr;
+}
+
+void *malloc(size_t size) {
+    if (size == 0) size = 1;
+    return bare_alloc(size, 8);
+}
+
+void *calloc(size_t count, size_t size) {
+    if (count == 0 || size == 0) return bare_alloc(1, 8);
+    size_t total = count * size;
+    void *ptr = bare_alloc(total, 8);
+    memset(ptr, 0, total);
+    return ptr;
+}
+
+void free(void *ptr) { (void)ptr; }
+
+// ---------------------------------------------------------------------------
+#if BARE_USE_CYCLE_COUNTER
+static inline uint64_t rdcycle(void) {
+    uint64_t c;
+    __asm__ volatile ("rdcycle %0" : "=r"(c));
+    return c;
+}
+
+static inline long cycles_to_ms(uint64_t start, uint64_t end) {
+#if BARE_CPU_HZ
+    uint64_t delta = end - start;
+    return (long)(delta / (BARE_CPU_HZ / 1000ULL));
+#else
+    (void)start; (void)end;
+    return -1;
+#endif
+}
+#else
+static inline uint64_t rdcycle(void) { return 0; }
+static inline long cycles_to_ms(uint64_t start, uint64_t end) {
+    (void)start; (void)end;
+    return -1;
+}
+#endif
+
+static inline int is_printable(unsigned char c) {
+    return (c >= 32 && c < 127);
+}
+
+static inline int is_whitespace(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+static inline int abs_int(int v) { return v < 0 ? -v : v; }
+
+static inline float bare_fabsf(float x) { return x < 0.0f ? -x : x; }
+
+float sqrtf(float x) {
+    return __builtin_sqrtf(x);
+}
+
+float expf(float x) {
+    // Fast exp approximation based on 2^x with a short polynomial for mantissa
+    const float LOG2E = 1.4426950408889634f;
+    const float LN2 = 0.6931471805599453f;
+    float y = x * LOG2E;
+    float ip = y >= 0.0f ? (float)((int)(y + 0.5f)) : (float)((int)(y - 0.5f));
+    float fp = y - ip;
+    float poly = 1.0f + fp * (0.696065642f + fp * 0.224494337f);
+    int exponent = (int)ip + 127;
+    if (exponent <= 0) exponent = 0;
+    if (exponent >= 255) exponent = 255;
+    union { uint32_t i; float f; } bits;
+    bits.i = (uint32_t)(exponent << 23);
+    return bits.f * poly;
+}
+
+float sinf(float x) {
+    const float PI = 3.1415926535897932f;
+    const float TWO_PI = 6.2831853071795865f;
+    while (x > PI) x -= TWO_PI;
+    while (x < -PI) x += TWO_PI;
+    const float B = 4.0f / PI;
+    const float C = -4.0f / (PI * PI);
+    float y = B * x + C * x * bare_fabsf(x);
+    const float P = 0.225f;
+    y = P * (y * bare_fabsf(y) - y) + y;
+    return y;
+}
+
+float cosf(float x) {
+    const float HALF_PI = 1.5707963267948966f;
+    return sinf(x + HALF_PI);
+}
+
+// ---------------------------------------------------------------------------
+// Transformer data structures (trimmed from run.c)
+typedef struct {
+    int dim;
+    int hidden_dim;
+    int n_layers;
+    int n_heads;
+    int n_kv_heads;
+    int vocab_size;
+    int seq_len;
+} Config;
+
+typedef struct {
+    float* token_embedding_table;
+    float* rms_att_weight;
+    float* rms_ffn_weight;
+    float* wq;
+    float* wk;
+    float* wv;
+    float* wo;
+    float* w1;
+    float* w2;
+    float* w3;
+    float* rms_final_weight;
+    float* wcls;
+} TransformerWeights;
+
+typedef struct {
+    float *x;
+    float *xb;
+    float *xb2;
+    float *hb;
+    float *hb2;
+    float *q;
+    float *k;
+    float *v;
+    float *att;
+    float *logits;
+    float *key_cache;
+    float *value_cache;
+} RunState;
+
+typedef struct {
+    Config config;
+    TransformerWeights weights;
+    RunState state;
+} Transformer;
+
+void malloc_run_state(RunState* s, Config* p) {
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    s->x = calloc(p->dim, sizeof(float));
+    s->xb = calloc(p->dim, sizeof(float));
+    s->xb2 = calloc(p->dim, sizeof(float));
+    s->hb = calloc(p->hidden_dim, sizeof(float));
+    s->hb2 = calloc(p->hidden_dim, sizeof(float));
+    s->q = calloc(p->dim, sizeof(float));
+    s->k = calloc(p->dim, sizeof(float));
+    s->v = calloc(p->dim, sizeof(float));
+    s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
+    s->logits = calloc(p->vocab_size, sizeof(float));
+    s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+    s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q || !s->k || !s->v ||
+        !s->att || !s->logits || !s->key_cache || !s->value_cache) {
+        panic("RunState allocation failed");
+    }
+}
+
+void free_run_state(RunState* s) { (void)s; }
+
+void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared_weights) {
+    int head_size = p->dim / p->n_heads;
+    unsigned long long n_layers = p->n_layers;
+    w->token_embedding_table = ptr;
+    ptr += p->vocab_size * p->dim;
+    w->rms_att_weight = ptr;
+    ptr += n_layers * p->dim;
+    w->wq = ptr;
+    ptr += n_layers * p->dim * (p->n_heads * head_size);
+    w->wk = ptr;
+    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
+    w->wv = ptr;
+    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
+    w->wo = ptr;
+    ptr += n_layers * (p->n_heads * head_size) * p->dim;
+    w->rms_ffn_weight = ptr;
+    ptr += n_layers * p->dim;
+    w->w1 = ptr;
+    ptr += n_layers * p->dim * p->hidden_dim;
+    w->w2 = ptr;
+    ptr += n_layers * p->hidden_dim * p->dim;
+    w->w3 = ptr;
+    ptr += n_layers * p->dim * p->hidden_dim;
+    w->rms_final_weight = ptr;
+    ptr += p->dim;
+    ptr += p->seq_len * head_size / 2;
+    ptr += p->seq_len * head_size / 2;
+    w->wcls = shared_weights ? w->token_embedding_table : ptr;
+}
+
+static void init_transformer_from_embedded(Transformer *t) {
+    size_t bytes = embedded_model_size();
+    if (bytes < sizeof(Config)) panic("model blob too small");
+    Config cfg_disk;
+    memcpy(&cfg_disk, MODEL_BIN_START, sizeof(Config));
+    int shared = cfg_disk.vocab_size > 0 ? 1 : 0;
+    cfg_disk.vocab_size = abs_int(cfg_disk.vocab_size);
+    t->config = cfg_disk;
+    float *weights_ptr = (float*)(MODEL_BIN_START + sizeof(Config));
+    memory_map_weights(&t->weights, &t->config, weights_ptr, shared);
+    malloc_run_state(&t->state, &t->config);
+}
+
+void free_transformer(Transformer* t) { free_run_state(&t->state); (void)t; }
+
+// ---------------------------------------------------------------------------
+// Math helpers reused from run.c
+void rmsnorm(float* o, float* x, float* weight, int size) {
+    float ss = 0.0f;
+    for (int j = 0; j < size; j++) ss += x[j] * x[j];
+    ss /= size;
+    ss += 1e-5f;
+    ss = 1.0f / sqrtf(ss);
+    for (int j = 0; j < size; j++) o[j] = weight[j] * (ss * x[j]);
+}
+
+// softmax implementation moved to riscv_vector_kernels.h
+
+void matmul(float* xout, float* x, float* w, int n, int d) {
+        for (int i = 0; i < d; i++) {
+        float val = 0.0f;
+        float* row = w + i * n;
+        for (int j = 0; j < n; j++) val += row[j] * x[j];
+        xout[i] = val;
+    }
+    //matmul_vector(xout, x, w, n, d);
+}
+
+float* forward(Transformer* transformer, int token, int pos) {
+    Config* p = &transformer->config;
+    TransformerWeights* w = &transformer->weights;
+    RunState* s = &transformer->state;
+    float *x = s->x;
+    int dim = p->dim;
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    int kv_mul = p->n_heads / p->n_kv_heads;
+    int hidden_dim =  p->hidden_dim;
+    int head_size = dim / p->n_heads;
+
+    float* content_row = w->token_embedding_table + token * dim;
+    memcpy(x, content_row, dim * sizeof(*x));
+    
+    check_stack_usage("forward_start");
+
+    for (unsigned long long l = 0; l < p->n_layers; l++) {
+        print_uart("Processing layer: ");
+        print_uart_int_dec(l);
+        print_uart("\r\n");
+        rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+        print_uart("RMSNorm 1 done\r\n");
+        int loff = l * p->seq_len * kv_dim;
+        float* layer_key_cache = s->key_cache + loff;
+        float* layer_val_cache = s->value_cache + loff;
+        float* k_slot = layer_key_cache + pos * kv_dim;
+        float* v_slot = layer_val_cache + pos * kv_dim;
+
+        matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
+        matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+        matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+        print_uart("QKV matmul done\r\n");
+
+        for (int i = 0; i < dim; i += 2) {
+            float head_dim = (float)(i % head_size);
+            float freq = expf(-9.210340371976184f * (head_dim / (float)head_size));
+            float val = (float)pos * freq;
+            float fcr = cosf(val);
+            float fci = sinf(val);
+            float q0 = s->q[i];
+            float q1 = s->q[i+1];
+            s->q[i]   = q0 * fcr - q1 * fci;
+            s->q[i+1] = q0 * fci + q1 * fcr;
+            if (i < kv_dim) {
+                float k0 = s->k[i];
+                float k1 = s->k[i+1];
+                s->k[i]   = k0 * fcr - k1 * fci;
+                s->k[i+1] = k0 * fci + k1 * fcr;
+            }
+        }
+        print_uart("RoPE done\r\n");
+
+        memcpy(k_slot, s->k, kv_dim * sizeof(float));
+        print_uart("K-slot info: ");
+        print_uart_int_dec((uintptr_t)k_slot);
+        print_uart(" ");
+        print_uart_int_dec((uintptr_t)s->k);
+        print_uart(" ");
+        print_uart_int_dec(kv_dim * sizeof(float));
+        print_uart("\r\n");
+
+        memcpy(v_slot, s->v, kv_dim * sizeof(float));
+        print_uart("V-slot info: ");
+        print_uart_int_dec((uintptr_t)v_slot);
+        print_uart(" ");
+        print_uart_int_dec((uintptr_t)s->v);
+        print_uart(" ");
+        print_uart_int_dec(kv_dim * sizeof(float));
+        print_uart("\r\n");
+
+        print_uart("KVCache done\r\n");
+
+        for (int h = 0; h < p->n_heads; h++) {
+            print_uart("Head ");
+            print_uart_int_dec(h);
+            print_uart(": ");
+            float* q = s->q + h * head_size;
+            print_uart("  q: "); print_uart_int_dec((uintptr_t)q); print_uart("\r\n");
+            float* att = s->att + h * p->seq_len;
+            print_uart("  att: "); print_uart_int_dec((uintptr_t)att); print_uart("\r\n");
+            float scale = 1.0f / sqrtf((float)head_size);
+            print_uart("  scale: "); print_uart_float(scale); print_uart("\r\n");
+            for (int t = 0; t <= pos; t++) {
+                print_uart("  t: "); print_uart_int_dec(t); print_uart("\r\n");
+                float* k = layer_key_cache + t * kv_dim + (h/kv_mul) * head_size;
+                print_uart("    k: "); print_uart_int_dec((uintptr_t)k); print_uart("\r\n");
+                float score = 0.0f;
+                for (int i = 0; i < head_size; i++) score += q[i] * k[i];
+                print_uart("    score: "); print_uart_float(score); print_uart("\r\n");
+                att[t] = score * scale;
+                print_uart("    att[t]: "); print_uart_float(att[t]); print_uart("\r\n");
+            }
+            print_uart("Scores\r\n");
+            for (int t = pos + 1; t < p->seq_len; t++) att[t] = -1e9f;
+            print_uart("Calling softmax...\r\n");
+            check_stack_usage("before_softmax");
+            softmax(att, pos + 1);
+            print_uart("Softmax returned\r\n");
+            float* xb = s->xb + h * head_size;
+            for (int i = 0; i < head_size; i++) xb[i] = 0.0f;
+            for (int t = 0; t <= pos; t++) {
+                float att_t = att[t];
+                float* v = layer_val_cache + t * kv_dim + (h/kv_mul) * head_size;
+                for (int i = 0; i < head_size; i++) xb[i] += att_t * v[i];
+            }
+            print_uart("Accum\r\n");
+            }
+            print_uart("Attention done\r\n");
+
+            matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+            print_uart("Output proj done\r\n");
+            for (int i = 0; i < dim; i++) x[i] = x[i] + s->xb2[i];//TODO
+            print_uart("Residual 1 done\r\n");
+            rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+            print_uart("RMSNorm 2 done\r\n");
+            matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+            matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+            print_uart("FFN Gate/Up done\r\n");
+            for (int i = 0; i < hidden_dim; i++) {
+                float val = s->hb[i];
+                val *= 1.0f / (1.0f + expf(-val));
+                s->hb[i] = val * s->hb2[i];
+            }
+            print_uart("SwiGLU done\r\n");
+            matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
+            print_uart("FFN Down done\r\n");
+            for (int i = 0; i < dim; i++) x[i] = x[i] + s->xb[i];
+            print_uart("Residual 2 done\r\n");
+        }
+        print_uart("Layer done");
+        print_uart("\r\n");
+        rmsnorm(x, x, w->rms_final_weight, dim);
+        print_uart("Final RMSNorm done\r\n");
+        matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+        print_uart("Classifier done\r\n");
+        print_uart("Model done");
+        print_uart("\r\n");
+        return s->logits;
+    }
+
+// ---------------------------------------------------------------------------
+// Tokenizer (trimmed from run.c, adapted for embedded data)
+typedef struct {
+    char *str;
+    int id;
+} TokenIndex;
+
+typedef struct {
+    char** vocab;
+    float* vocab_scores;
+    TokenIndex *sorted_vocab;
+    int vocab_size;
+    unsigned int max_token_length;
+    unsigned char byte_pieces[512];
+} Tokenizer;
+
+static void swap_token(TokenIndex* a, TokenIndex* b) {
+    TokenIndex tmp = *a; *a = *b; *b = tmp;
+}
+
+static void quicksort_tokens(TokenIndex* arr, int left, int right) {
+    while (left < right) {
+        int i = left;
+        int j = right;
+        char* pivot = arr[left + (right - left) / 2].str;
+        while (i <= j) {
+            while (strcmp(arr[i].str, pivot) < 0) i++;
+            while (strcmp(arr[j].str, pivot) > 0) j--;
+            if (i <= j) {
+                swap_token(&arr[i], &arr[j]);
+                i++; j--;
+            }
+        }
+        if (left < j) quicksort_tokens(arr, left, j);
+        left = i;
+    }
+}
+
+static TokenIndex* tokenizer_sorted(Tokenizer* t) {
+    if (t->sorted_vocab) return t->sorted_vocab;
+    t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
+    if (!t->sorted_vocab) panic("token sorted alloc");
+    for (int i = 0; i < t->vocab_size; i++) {
+        t->sorted_vocab[i].str = t->vocab[i];
+        t->sorted_vocab[i].id = i;
+    }
+    quicksort_tokens(t->sorted_vocab, 0, t->vocab_size - 1);
+    return t->sorted_vocab;
+}
+
+static int token_lookup(Tokenizer* t, char *str) {
+    TokenIndex* sorted = tokenizer_sorted(t);
+    int lo = 0, hi = t->vocab_size - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        int cmp = strcmp(sorted[mid].str, str);
+        if (cmp == 0) return sorted[mid].id;
+        if (cmp < 0) lo = mid + 1; else hi = mid - 1;
+    }
+    return -1;
+}
+
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+static int parse_byte_token(const char* piece, unsigned char* out) {
+    if (!piece || piece[0] != '<' || piece[1] != '0' || piece[2] != 'x') return 0;
+    int hi = hex_nibble(piece[3]);
+    int lo = hex_nibble(piece[4]);
+    if (hi < 0 || lo < 0 || piece[5] != '>' || piece[6] != '\0') return 0;
+    *out = (unsigned char)((hi << 4) | lo);
+    return 1;
+}
+
+static void build_tokenizer_from_embedded(Tokenizer* t, int vocab_size) {
+    t->vocab_size = vocab_size;
+    for (int i = 0; i < 256; i++) {
+        t->byte_pieces[i * 2] = (unsigned char)i;
+        t->byte_pieces[i * 2 + 1] = '\0';
+    }
+    const unsigned char *ptr = TOKENIZER_BIN_START;
+    const unsigned char *end = TOKENIZER_BIN_END;
+    if (ptr + sizeof(int) > end) panic("tokenizer blob too small");
+    memcpy(&t->max_token_length, ptr, sizeof(int));
+    ptr += sizeof(int);
+    t->vocab = malloc(vocab_size * sizeof(char*));
+    t->vocab_scores = malloc(vocab_size * sizeof(float));
+    t->sorted_vocab = NULL;
+    if (!t->vocab || !t->vocab_scores) panic("tokenizer alloc");
+    for (int i = 0; i < vocab_size; i++) {
+        if (ptr + sizeof(float) + sizeof(int) > end) panic("tokenizer truncated");
+        memcpy(t->vocab_scores + i, ptr, sizeof(float));
+        ptr += sizeof(float);
+        int len;
+        memcpy(&len, ptr, sizeof(int));
+        ptr += sizeof(int);
+        if (ptr + len > end) panic("token string truncated");
+        t->vocab[i] = malloc(len + 1);
+        if (!t->vocab[i]) panic("token malloc");
+        memcpy(t->vocab[i], ptr, len);
+        t->vocab[i][len] = '\0';
+        ptr += len;
+    }
+}
+
+void free_tokenizer(Tokenizer* t) { (void)t; }
+
+char* decode(Tokenizer* t, int prev_token, int token) {
+    char *piece = t->vocab[token];
+    if (prev_token == 1 && piece[0] == ' ') piece++;
+    unsigned char byte_val;
+    if (parse_byte_token(piece, &byte_val)) piece = (char*)t->byte_pieces + byte_val * 2;
+    return piece;
+}
+
+static void concat_tokens(char *dst, size_t cap, const char *a, const char *b) {
+    size_t idx = 0;
+    for (size_t i = 0; a[i] && idx < cap - 1; i++) dst[idx++] = a[i];
+    for (size_t i = 0; b[i] && idx < cap - 1; i++) dst[idx++] = b[i];
+    dst[idx] = '\0';
+}
+
+static int str_lookup(Tokenizer* t, char *str) {
+    return token_lookup(t, str);
+}
+
+void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
+    if (text == NULL) panic("encode text NULL");
+    char* str_buffer = malloc((t->max_token_length*2 + 3) * sizeof(char));
+    size_t str_len = 0;
+    *n_tokens = 0;
+    if (bos) tokens[(*n_tokens)++] = 1;
+    if (text[0] != '\0') {
+        int dummy_prefix = str_lookup(t, " ");
+        tokens[(*n_tokens)++] = dummy_prefix;
+    }
+    for (char *c = text; *c != '\0'; c++) {
+        if ((*c & 0xC0) != 0x80) str_len = 0;
+        str_buffer[str_len++] = *c;
+        str_buffer[str_len] = '\0';
+        if ((*(c+1) & 0xC0) == 0x80 && str_len < 4) continue;
+        int id = str_lookup(t, str_buffer);
+        if (id != -1) {
+            tokens[(*n_tokens)++] = id;
+        } else {
+            for (size_t i = 0; i < str_len; i++) {
+                char buf[2] = { str_buffer[i], '\0' };
+                int single_id = str_lookup(t, buf);
+                if (single_id == -1) panic("tokenizer single missing");
+                tokens[(*n_tokens)++] = single_id;
+            }
+        }
+        str_len = 0;
+    }
+    char merge_buf[1024];
+    while (1) {
+        float best_score = -1e10f;
+        int best_id = -1;
+        int best_idx = -1;
+        for (int i = 0; i < (*n_tokens - 1); i++) {
+            concat_tokens(merge_buf, sizeof(merge_buf), t->vocab[tokens[i]], t->vocab[tokens[i+1]]);
+            int id = str_lookup(t, merge_buf);
+            if (id != -1 && t->vocab_scores[id] > best_score) {
+                best_score = t->vocab_scores[id];
+                best_id = id;
+                best_idx = i;
+            }
+        }
+        if (best_idx == -1) break;
+        tokens[best_idx] = best_id;
+        for (int i = best_idx+1; i < (*n_tokens-1); i++) tokens[i] = tokens[i+1];
+        (*n_tokens)--;
+    }
+    if (eos) tokens[(*n_tokens)++] = 2;
+    free(str_buffer);
+}
+
+void safe_printf(char *piece) {
+    if (!piece || !piece[0]) return;
+    if (piece[1] == '\0') {
+        unsigned char byte_val = piece[0];
+        if (!(is_printable(byte_val) || is_whitespace(byte_val))) return;
+    }
+    print_uart(piece);
+}
+
+// ---------------------------------------------------------------------------
+// Sampler
+
+typedef struct {
+    float prob;
+    int index;
+} ProbIndex;
+
+typedef struct {
+    int vocab_size;
+    ProbIndex* probindex;
+    float temperature;
+    float topp;
+    unsigned long long rng_state;
+} Sampler;
+
+unsigned int random_u32(unsigned long long *state) {
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
+}
+
+float random_f32(unsigned long long *state) {
+    return (random_u32(state) >> 8) / 16777216.0f;
+}
+
+int sample_argmax(float* probabilities, int n) {
+    int max_i = 0;
+    float max_p = probabilities[0];
+    for (int i = 1; i < n; i++) {
+        if (probabilities[i] > max_p) {
+            max_p = probabilities[i];
+            max_i = i;
+        }
+    }
+    return max_i;
+}
+
+int sample_mult(float* probabilities, int n, float coin) {
+    print_uart("sample_mult enter\r\n");
+    float cdf = 0.0f;
+    for (int i = 0; i < n; i++) {
+        cdf += probabilities[i];
+        if (coin < cdf) {
+            print_uart("sample_mult hit: ");
+            print_uart_int_dec(i);
+            print_uart(" cdf: ");
+            print_uart_float(cdf);
+            print_uart("\r\n");
+            return i;
+        }
+    }
+    print_uart("sample_mult fallback to last\r\n");
+    return n - 1;
+}
+
+void build_sampler(Sampler* sampler, int vocab_size, float temperature, float topp, unsigned long long seed) {
+    sampler->vocab_size = vocab_size;
+    sampler->temperature = temperature;
+    sampler->topp = topp;
+    sampler->rng_state = seed;
+    sampler->probindex = malloc(vocab_size * sizeof(ProbIndex));
+    if (!sampler->probindex) panic("sampler alloc");
+}
+
+void free_sampler(Sampler* sampler) { free(sampler->probindex); }
+
+int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, float coin) {
+    print_uart("sample_topp enter\r\n");
+    int n0 = 0;
+    const float cutoff = (1.0f - topp) / (n - 1);
+    for (int i = 0; i < n; i++) {
+        if (probabilities[i] >= cutoff) {
+            probindex[n0].prob = probabilities[i];
+            probindex[n0].index = i;
+            n0++;
+        }
+    }
+    print_uart("sample_topp n0: "); print_uart_int_dec(n0); print_uart("\r\n");
+
+    for (int i = 1; i < n0; i++) {
+        ProbIndex key = probindex[i];
+        int j = i - 1;
+        while (j >= 0 && probindex[j].prob < key.prob) {
+            probindex[j+1] = probindex[j];
+            j--;
+        }
+        probindex[j+1] = key;
+    }
+    float cumulative = 0.0f;
+    int last = n0 - 1;
+    for (int i = 0; i < n0; i++) {
+        cumulative += probindex[i].prob;
+        if (cumulative > topp) { last = i; break; }
+    }
+    print_uart("sample_topp cumulative: "); print_uart_float(cumulative); 
+    print_uart(" last: "); print_uart_int_dec(last); print_uart("\r\n");
+
+    float r = coin * cumulative;
+    float cdf = 0.0f;
+    for (int i = 0; i <= last; i++) {
+        cdf += probindex[i].prob;
+        if (r < cdf) {
+            print_uart("sample_topp selected: "); print_uart_int_dec(probindex[i].index); print_uart("\r\n");
+            return probindex[i].index;
+        }
+    }
+    print_uart("sample_topp fallback: "); print_uart_int_dec(probindex[last].index); print_uart("\r\n");
+    return probindex[last].index;
+}
+
+int sample_token(Sampler* sampler, float* logits) {
+    int next;
+    if (sampler->temperature == 0.0f) {
+        next = sample_argmax(logits, sampler->vocab_size);
+    } else {
+        for (int q=0; q<sampler->vocab_size; q++) logits[q] /= sampler->temperature;
+        softmax(logits, sampler->vocab_size);
+        print_uart("Softmax (sampling) done\r\n");
+        float coin = random_f32(&sampler->rng_state);
+        print_uart("Coin: "); print_uart_float(coin); print_uart("\r\n");
+        if (sampler->topp <= 0 || sampler->topp >= 1) {
+            next = sample_mult(logits, sampler->vocab_size, coin);
+        } else {
+            next = sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
+        }
+    }
+    return next;
+}
+
+// ---------------------------------------------------------------------------
+// Generation loop (prompt is compile-time string)
+void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
+    if (prompt == NULL) panic("prompt NULL");
+    int num_prompt_tokens = 0;
+    int* prompt_tokens = malloc((strlen(prompt)+3) * sizeof(int));
+    encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+    if (num_prompt_tokens < 1) panic("prompt encode empty");
+
+#if BARE_USE_CYCLE_COUNTER
+    uint64_t start_cycles = 0;
+    uint64_t ttft_start = rdcycle();
+    uint64_t ttft_end = 0;
+#endif
+    int token = prompt_tokens[0];
+    int pos = 0;
+    int line_char_count = 0;
+    char word_buffer[256];
+    int word_len = 0;
+    while (pos < steps) {
+        float* logits = forward(transformer, token, pos);
+        int next;
+        print_uart("next token logits computed");
+        print_uart("\r\n");
+        if (pos < num_prompt_tokens - 1) {
+            next = prompt_tokens[pos + 1];
+        } else {
+            next = sample_token(sampler, logits);
+#if BARE_USE_CYCLE_COUNTER
+            if (ttft_end == 0) ttft_end = rdcycle();
+#endif
+        }
+        pos++;
+        if (next == 1) break;
+        char* piece = decode(tokenizer, token, next);
+
+        if (piece) {
+            int should_print = 1;
+            if (piece[0] == '\0') should_print = 0;
+            else if (piece[1] == '\0') {
+                unsigned char byte_val = piece[0];
+                if (!(is_printable(byte_val) || is_whitespace(byte_val))) should_print = 0;
+            }
+
+            if (should_print) {
+                for (char *c = piece; *c != '\0'; c++) {
+                    if (is_whitespace((unsigned char)*c)) {
+                        if (word_len > 0) {
+                            if (line_char_count + word_len > 40) {
+                                print_uart("\r\n");
+                                line_char_count = 0;
+                            }
+                            for (int i = 0; i < word_len; i++) write_serial((uint8_t)word_buffer[i]);
+                            line_char_count += word_len;
+                            word_len = 0;
+                        }
+                        if (*c == '\n' || *c == '\r') {
+                            print_uart("\r\n");
+                            line_char_count = 0;
+                        } else {
+                            if (line_char_count >= 40) {
+                                print_uart("\r\n");
+                                line_char_count = 0;
+                            } else {
+                                write_serial((uint8_t)*c);
+                                line_char_count++;
+                            }
+                        }
+                    } else {
+                        if (word_len < 255) {
+                            word_buffer[word_len++] = *c;
+                        } else {
+                            if (line_char_count + word_len > 40) {
+                                print_uart("\r\n");
+                                line_char_count = 0;
+                            }
+                            for (int i = 0; i < word_len; i++) write_serial((uint8_t)word_buffer[i]);
+                            line_char_count += word_len;
+                            word_len = 0;
+                            word_buffer[word_len++] = *c;
+                        }
+                    }
+                }
+            }
+        }
+
+        token = next;
+#if BARE_USE_CYCLE_COUNTER
+        if (start_cycles == 0) start_cycles = rdcycle();
+#endif
+    }
+    if (word_len > 0) {
+        if (line_char_count + word_len > 40) print_uart("\r\n");
+        for (int i = 0; i < word_len; i++) write_serial((uint8_t)word_buffer[i]);
+    }
+    print_uart("\r\n");
+#if BARE_USE_CYCLE_COUNTER
+    if (start_cycles != 0) {
+        uint64_t end_cycles = rdcycle();
+        long ms = cycles_to_ms(start_cycles, end_cycles);
+        if (ms > 0 && pos > 1) {
+            float tok_s = (float)(pos-1) / (ms / 1000.0f);
+            print_uart("[bare] tok/s: ");
+            print_uart_float(tok_s);
+            print_uart("\r\n");
+        } else {
+            print_uart("[bare] cycles: ");
+            print_uart_int_dec((unsigned long long)(end_cycles - start_cycles));
+            print_uart("\r\n");
+        }
+    }
+    if (ttft_end != 0) {
+        long ttft_ms = cycles_to_ms(ttft_start, ttft_end);
+        print_uart("[bare] TTFT: ");
+        print_uart_int_dec((uint64_t)ttft_ms);
+        print_uart(" ms\r\n");
+    }
+#endif
+    free(prompt_tokens);
+}
+
+// ---------------------------------------------------------------------------
+int main(void) {
+    // Enable VS extension (bits 9-10 of mstatus)
+    unsigned long mstatus;
+    asm volatile("csrr %0, mstatus" : "=r"(mstatus));
+    mstatus |= 0x200; 
+    asm volatile("csrw mstatus, %0" :: "r"(mstatus));
+
+    init_uart(CLOCK_FREQUENCY, UART_BITRATE);
+    print_uart("[bare] model bytes: ");
+    print_uart_int_dec((unsigned long long)embedded_model_size());
+    print_uart("\r\n");
+    print_uart("[bare] tokenizer bytes: ");
+    print_uart_int_dec((unsigned long long)embedded_tokenizer_size());
+    print_uart("\r\n");
+
+    Transformer transformer;
+    init_transformer_from_embedded(&transformer);
+
+    Tokenizer tokenizer;
+    build_tokenizer_from_embedded(&tokenizer, transformer.config.vocab_size);
+
+    Sampler sampler;
+    build_sampler(&sampler, transformer.config.vocab_size, BARE_TEMPERATURE, BARE_TOPP, BARE_SEED);
+
+    static char prompt[] = BARE_PROMPT;
+    int steps = BARE_STEPS;
+    generate(&transformer, &tokenizer, &sampler, prompt, steps);
+
+    free_sampler(&sampler);
+    free_tokenizer(&tokenizer);
+    free_transformer(&transformer);
+
+    print_uart("[bare] done.\r\n");
+    return 0;
+}

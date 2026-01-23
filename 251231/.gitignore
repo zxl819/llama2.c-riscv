@@ -1,0 +1,13 @@
+# Ignore build artifact directory
+build/
+
+# Optional: ignore generated binary files
+*.bin
+
+# Ignore virtualenvs and common large artifacts
+venv/
+performance/.venv
+*.xlsx
+*.pptx
+*.log
+*.dump

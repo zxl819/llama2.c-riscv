@@ -264,17 +264,35 @@ int printf(const char* fmt, ...)
   va_end(ap);
   return 0;
 }
-
+// 将 putbuf 定义为静态辅助函数，放在 sprintf 的外部
+static void putbuf(int ch, void **pp) {
+    char **p = (char**)pp;
+    **p = (char)ch;
+    (*p)++;
+}
 int sprintf(char* str, const char* fmt, ...)
 {
-  va_list ap; char* str0 = str; va_start(ap, fmt);
-  // very small sprintf used only for counters print in _init(); keep minimal
+  va_list ap;
+  char* str0 = str;
+  va_start(ap, fmt);
+
   // Reuse vprintfmt by writing into buffer
-  void putbuf(int ch, void **pp) { char **p = (char**)pp; **p = (char)ch; (*p)++; }
   vprintfmt((void*)putbuf, (void**)&str, fmt, ap);
-  *str = 0; va_end(ap);
+
+  *str = 0; // Null-terminate the string
+  va_end(ap);
   return (int)(str - str0);
 }
+// int sprintf(char* str, const char* fmt, ...)
+// {
+//   va_list ap; char* str0 = str; va_start(ap, fmt);
+//   // very small sprintf used only for counters print in _init(); keep minimal
+//   // Reuse vprintfmt by writing into buffer
+//   void putbuf(int ch, void **pp) { char **p = (char**)pp; **p = (char)ch; (*p)++; }
+//   vprintfmt((void*)putbuf, (void**)&str, fmt, ap);
+//   *str = 0; va_end(ap);
+//   return (int)(str - str0);
+// }
 
 void* memcpy(void* dest, const void* src, size_t len)
 {

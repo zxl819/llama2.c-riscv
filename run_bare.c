@@ -21,6 +21,31 @@ int strcmp(const char *s1, const char *s2);
 size_t strlen(const char *s);
 
 // ---------------------------------------------------------------------------
+// Trap diagnostics
+// If a trap happens, crt.S calls handle_trap(cause, epc, regs). If we don't
+// provide our own, the default weak handler exits with code -32, which shows as
+// "*** FAILED *** (tohost = -32)" in Spike. Provide a strong handler here so
+// we can see the real cause.
+static inline uintptr_t read_csr_mtval(void) {
+    uintptr_t x;
+    __asm__ volatile ("csrr %0, mtval" : "=r"(x));
+    return x;
+}
+
+uintptr_t handle_trap(uintptr_t cause, uintptr_t epc, uintptr_t regs[32]) {
+    (void)regs;
+    uintptr_t mtval = read_csr_mtval();
+    printf("[trap] mcause=0x%lx mepc=0x%lx mtval=0x%lx\n",
+           (unsigned long)cause, (unsigned long)epc, (unsigned long)mtval);
+    // Common causes:
+    //   2  = illegal instruction
+    //   4/6 = load/store address misaligned
+    //   5/7 = load/store access fault
+    exit(224);
+    return epc;
+}
+
+// ---------------------------------------------------------------------------
 // Build-time knobs (override via e.g. `make rvbare CFLAGS+=-DBARE_STEPS=128`)
 #ifndef BARE_PROMPT
 #define BARE_PROMPT "what is math?" 
@@ -155,7 +180,14 @@ static inline int abs_int(int v) { return v < 0 ? -v : v; }
 static inline float bare_fabsf(float x) { return x < 0.0f ? -x : x; }
 
 float sqrtf(float x) {
-    return __builtin_sqrtf(x);
+    float xhalf = 0.5f * x;
+    union { float f; uint32_t i; } u;
+    u.f = x;
+    u.i = 0x5f3759dfu - (u.i >> 1);
+    float y = u.f;
+    y = y * (1.5f - (xhalf * y * y));
+    y = y * (1.5f - (xhalf * y * y));
+    return x * y;
 }
 
 float expf(float x) {

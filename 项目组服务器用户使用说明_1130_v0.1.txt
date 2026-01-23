@@ -1,0 +1,16 @@
+开芯院WIFI：
+主楼 Kaiyuan: sHyug36#r9%JH*8
+主楼 Kaiyuan-fk: KX68z$73tqgNQ*U
+新技术大厦8层 BOSC:  cQHU7tr@*98Bb#r
+
+服务器基本使用说明：
+1.联系管理员并提供用户密码（尽可能复杂，或由管理员提供随机复杂密码），由管理员创建用户
+2.在开芯院网络中登录服务器（https://172.38.9.100:8443/etx/）
+
+关于EDA的使用（建议写到用户的.bashrc中）：
+module load license		//导入license
+module av     			//查看可用EDA工具
+module load xxx			//导入特定的EDA工具
+
+关于访问其他节点：
+ssh -X node02			//访问节点02

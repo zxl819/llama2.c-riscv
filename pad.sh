@@ -1,0 +1,233 @@
+# Makefile for FPGA test binaries with multiple target sizes
+
+# 默认目标大小设置
+OPERATOR_TARGET_SIZE ?= 1048576      # 1MB
+MODEL_TARGET_SIZE ?= 104857600       # 100MB
+
+# 目录设置
+OPERATOR_DIR := operator_padded
+MODEL_DIR := model_padded
+CACHE_DIR := .pad_cache
+
+# 分类你的测试文件（根据你的实际文件调整）
+OPERATOR_BINS := $(wildcard matmul-*.bin) rvv_*.bin timer.bin printf-scanf.bin
+MODEL_BINS := $(wildcard model-*.bin) wave.wses  # 添加你的模型文件
+
+# 生成目标文件列表
+OPERATOR_TARGETS := $(addprefix $(OPERATOR_DIR)/, $(OPERATOR_BINS))
+MODEL_TARGETS := $(addprefix $(MODEL_DIR)/, $(MODEL_BINS))
+
+# 当前选择的测试文件
+CURRENT_TEST ?= matmul_matrix_inline_16x16_50M.bin
+CURRENT_TYPE ?= auto
+
+# 根据文件名自动判断类型
+ifeq ($(CURRENT_TYPE),auto)
+  ifneq ($(filter $(CURRENT_TEST),$(OPERATOR_BINS)),)
+    CURRENT_TYPE := operator
+  else ifneq ($(filter $(CURRENT_TEST),$(MODEL_BINS)),)
+    CURRENT_TYPE := model
+  else
+    $(error Cannot auto-detect type for $(CURRENT_TEST))
+  endif
+endif
+
+# 根据类型选择目标大小和输出目录
+ifeq ($(CURRENT_TYPE),operator)
+  TARGET_SIZE := $(OPERATOR_TARGET_SIZE)
+  OUTPUT_DIR := $(OPERATOR_DIR)
+else ifeq ($(CURRENT_TYPE),model)
+  TARGET_SIZE := $(MODEL_TARGET_SIZE)
+  OUTPUT_DIR := $(MODEL_DIR)
+else
+  $(error Invalid CURRENT_TYPE: $(CURRENT_TYPE))
+endif
+
+# 主目标
+.DEFAULT_GOAL := test.bin
+
+# 确保目录存在
+$(shell mkdir -p $(OPERATOR_DIR) $(MODEL_DIR) $(CACHE_DIR))
+
+# 生成 cache key 的函数
+define get_cache_key
+$(shell echo "$(1)_$(2)" | md5sum | cut -d' ' -f1)
+endef
+
+# test.bin 目标
+test.bin: $(OUTPUT_DIR)/$(CURRENT_TEST)
+	@echo "Creating test.bin from $(CURRENT_TEST) ($(CURRENT_TYPE))..."
+	@cp $< test.bin
+	@echo "test.bin is ready (size: $$(stat -c%s test.bin 2>/dev/null || stat -f%z test.bin) bytes)"
+	@echo "Target size: $(shell echo $(TARGET_SIZE) | awk '{printf "%.1f MB", $$1/1048576}')"
+
+# 为算子文件创建 padded 版本的规则
+$(OPERATOR_DIR)/%.bin: %.bin
+	@echo "Padding operator file $< to $(OPERATOR_TARGET_SIZE) bytes..."
+	@$(call pad_file,$<,$@,$(OPERATOR_TARGET_SIZE))
+
+# 为模型文件创建 padded 版本的规则
+$(MODEL_DIR)/%.bin: %.bin
+	@echo "Padding model file $< to $(MODEL_TARGET_SIZE) bytes..."
+	@$(call pad_file,$<,$@,$(MODEL_TARGET_SIZE))
+
+# 处理 .wses 文件（如果需要）
+$(MODEL_DIR)/%.wses: %.wses
+	@echo "Padding wave file $< to $(MODEL_TARGET_SIZE) bytes..."
+	@$(call pad_file,$<,$@,$(MODEL_TARGET_SIZE))
+
+# 定义 pad_file 函数
+define pad_file
+	@FILE_SIZE=$$(stat -c%s "$(1)" 2>/dev/null || stat -f%z "$(1)"); \
+	CACHE_KEY=$$(echo "$(1)_$(3)" | md5sum | cut -d' ' -f1); \
+	CACHE_FILE="$(CACHE_DIR)/$${CACHE_KEY}.padded"; \
+	CACHE_META="$(CACHE_DIR)/$${CACHE_KEY}.meta"; \
+	\
+	# 检查缓存 \
+	if [ -f "$$CACHE_FILE" ] && [ -f "$$CACHE_META" ]; then \
+		CACHED_INPUT=$$(head -n1 "$$CACHE_META"); \
+		CACHED_SIZE=$$(tail -n1 "$$CACHE_META"); \
+		if [ "$$CACHED_INPUT" = "$(1)" ] && [ "$$CACHED_SIZE" = "$$FILE_SIZE" ]; then \
+			echo "Using cached version..."; \
+			cp "$$CACHE_FILE" "$(2)"; \
+			echo "Copied from cache: $(2)"; \
+			exit 0; \
+		fi; \
+	fi; \
+	\
+	# 检查文件大小 \
+	if [ $$FILE_SIZE -gt $(3) ]; then \
+		echo "Error: $(1) ($$FILE_SIZE bytes) is larger than target size ($(3) bytes)"; \
+		echo "Difference: $$(($$FILE_SIZE - $(3))) bytes too large"; \
+		exit 1; \
+	fi; \
+	\
+	PADDING_SIZE=$$(($(3) - $$FILE_SIZE)); \
+	echo "Padding with $$PADDING_SIZE bytes of zeros..."; \
+	\
+	# 创建新文件并填充 \
+	cp "$(1)" "$$CACHE_FILE"; \
+	if [ $$PADDING_SIZE -gt 0 ]; then \
+		dd if=/dev/zero bs=1 count=$$PADDING_SIZE >> "$$CACHE_FILE" 2>/dev/null; \
+	fi; \
+	\
+	# 保存缓存元数据 \
+	echo "$(1)" > "$$CACHE_META"; \
+	echo "$$FILE_SIZE" >> "$$CACHE_META"; \
+	\
+	# 复制到目标位置 \
+	cp "$$CACHE_FILE" "$(2)"; \
+	\
+	FINAL_SIZE=$$(stat -c%s "$(2)" 2>/dev/null || stat -f%z "$(2)"); \
+	echo "Created: $(2) (original: $$FILE_SIZE, padded: $$FINAL_SIZE)"; \
+	echo "Cached for future use"
+endef
+
+# 快捷命令
+.PHONY: all-operators all-models all clean flash help set-test list
+
+# 创建所有算子文件的 padded 版本
+all-operators: $(OPERATOR_TARGETS)
+	@echo "All operator binaries padded and ready in $(OPERATOR_DIR)/"
+
+# 创建所有模型文件的 padded 版本
+all-models: $(MODEL_TARGETS)
+	@echo "All model binaries padded and ready in $(MODEL_DIR)/"
+
+# 创建所有文件的 padded 版本
+all: all-operators all-models
+	@echo "All files padded and ready"
+
+# 设置当前测试用例
+set-test:
+ifndef TEST
+	@echo "Usage: make set-test TEST=filename.bin [TYPE=operator|model|auto]"
+	@echo ""
+	@echo "Available operator tests:"
+	@for f in $(OPERATOR_BINS); do echo "  $$f"; done
+	@echo ""
+	@echo "Available model tests:"
+	@for f in $(MODEL_BINS); do echo "  $$f"; done
+else
+	@if [ -f "$(TEST)" ]; then \
+		if [ -z "$(TYPE)" ]; then \
+			if [ -n "$(filter $(TEST),$(OPERATOR_BINS))" ]; then \
+				TYPE=operator; \
+			elif [ -n "$(filter $(TEST),$(MODEL_BINS))" ]; then \
+				TYPE=model; \
+			else \
+				echo "Warning: Cannot auto-detect type for $(TEST), using operator"; \
+				TYPE=operator; \
+			fi; \
+		fi; \
+		echo "Setting current test to: $(TEST) (type: $$TYPE)"; \
+		sed -i.bak '/^CURRENT_TEST /d; /^CURRENT_TYPE /d' Makefile; \
+		echo "CURRENT_TEST ?= $(TEST)" >> Makefile; \
+		echo "CURRENT_TYPE ?= $$TYPE" >> Makefile; \
+		rm -f test.bin; \
+		echo "Run 'make' to create test.bin"; \
+	else \
+		echo "Error: File $(TEST) not found"; \
+		exit 1; \
+	fi
+endif
+
+# 列出所有测试文件
+list:
+	@echo "Operator test files (target: $(OPERATOR_TARGET_SIZE) bytes):"
+	@for f in $(OPERATOR_BINS); do \
+		if [ -f "$(OPERATOR_DIR)/$$f" ]; then \
+			echo "  ✓ $$f"; \
+		else \
+			echo "  ○ $$f"; \
+		fi; \
+	done
+	@echo ""
+	@echo "Model test files (target: $(MODEL_TARGET_SIZE) bytes):"
+	@for f in $(MODEL_BINS); do \
+		if [ -f "$(MODEL_DIR)/$$f" ]; then \
+			echo "  ✓ $$f"; \
+		else \
+			echo "  ○ $$f"; \
+		fi; \
+	done
+	@echo ""
+	@echo "Current test: $(CURRENT_TEST) ($(CURRENT_TYPE))"
+
+# 清理
+clean:
+	rm -rf test.bin $(OPERATOR_DIR) $(MODEL_DIR) $(CACHE_DIR)
+	@echo "Cleaned up all generated files"
+
+# 烧录
+flash: test.bin
+	@echo "Flashing test.bin to device..."
+	# 在这里添加你的实际烧录命令
+	# 例如：your_flash_tool test.bin
+
+# 查看帮助
+help:
+	@echo "FPGA Test Binary Management System"
+	@echo "====================================="
+	@echo ""
+	@echo "Target sizes:"
+	@echo "  Operators: $(shell echo $(OPERATOR_TARGET_SIZE) | awk '{printf "%d bytes (%.1f MB)", $$1, $$1/1048576}')"
+	@echo "  Models:    $(shell echo $(MODEL_TARGET_SIZE) | awk '{printf "%d bytes (%.1f MB)", $$1, $$1/1048576}')"
+	@echo ""
+	@echo "Available targets:"
+	@echo "  make                 - Create test.bin from current test"
+	@echo "  make all             - Create padded versions of ALL files"
+	@echo "  make all-operators   - Create padded versions of operator files"
+	@echo "  make all-models      - Create padded versions of model files"
+	@echo "  make clean           - Remove all generated files"
+	@echo "  make set-test TEST=file.bin [TYPE=operator|model|auto]"
+	@echo "                      - Change current test file"
+	@echo "  make list            - List all test files"
+	@echo "  make flash           - Flash test.bin to device"
+	@echo ""
+	@echo "Current settings:"
+	@echo "  Test file: $(CURRENT_TEST)"
+	@echo "  Type:      $(CURRENT_TYPE)"
+	@echo "  Target dir: $(OUTPUT_DIR)"
+	@echo "  Target size: $(shell echo $(TARGET_SIZE) | awk '{printf "%.1f MB", $$1/1048576}')"
+	@echo ""

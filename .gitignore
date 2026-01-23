@@ -1,0 +1,41 @@
+# Build artifacts
+build/
+**/build/
+
+# Bare-metal outputs / binaries
+*.o
+*.a
+*.elf
+*.bin
+*.dump
+*.log
+
+# Archives / large artifacts
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.pdf
+*.vsdx
+~$*
+
+# Local SDKs / snapshots / vendor drops (workspace-specific)
+SDK_V2.0_251221/
+260113_perf/
+251231/matrix-kernel-clang14/
+260105_chat/performance/stack/
+260105_chat/performance/*.txt
+gitea/
+kernel/
+store/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor/OS
+.DS_Store
+Thumbs.db

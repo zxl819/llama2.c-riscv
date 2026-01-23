@@ -1,0 +1,26 @@
+[
+    {
+        "messages": [
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "你好！有什么我可以帮你的吗？"}
+        ]
+    },
+    {
+        "messages": [
+            {"role": "user", "content": "讲个故事"},
+            {"role": "assistant", "content": "从前有座山，山里有座庙，庙里有个老和尚给小和尚讲故事。"}
+        ]
+    },
+    {
+        "messages": [
+            {"role": "user", "content": "你是谁？"},
+            {"role": "assistant", "content": "我是由 Llama 2 架构驱动的聊天助手。"}
+        ]
+    },
+    {
+        "messages": [
+            {"role": "user", "content": "天气怎么样？"},
+            {"role": "assistant", "content": "我无法查看实时天气，建议你查看天气预报。"}
+        ]
+    }
+]

@@ -8,8 +8,11 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
-#include <riscv_vector.h>
+#include "uart_helper.c"
 #include "riscv_vector_kernels.h"
+
+#define CLOCK_FREQUENCY 50000000
+#define UART_BITRATE    115200
 
 // ---------------------------------------------------------------------------
 // Tiny libc hooks provided by bare_syscalls.c (no system headers required)
@@ -25,11 +28,11 @@ size_t strlen(const char *s);
 // ---------------------------------------------------------------------------
 // Build-time knobs (override via e.g. `make rvbare CFLAGS+=-DBARE_STEPS=128`)
 #ifndef BARE_PROMPT
-#define BARE_PROMPT "what is math?" 
+#define BARE_PROMPT "Once upon a time" 
 #endif
 //"Once upon a time"
 #ifndef BARE_STEPS
-#define BARE_STEPS 512
+#define BARE_STEPS 64
 #endif
 
 #ifndef BARE_TEMPERATURE
@@ -48,12 +51,18 @@ size_t strlen(const char *s);
 #define BARE_HEAP_BYTES (32 * 1024 * 1024)
 #endif
 
+// Default allocation alignment for the bare-metal bump allocator.
+// Keep this in one place to avoid hard-coded alignment values across files.
+#ifndef BARE_ALLOC_ALIGN
+#define BARE_ALLOC_ALIGN 64
+#endif
+
 #ifndef BARE_CPU_HZ
-#define BARE_CPU_HZ 0
+#define BARE_CPU_HZ CLOCK_FREQUENCY
 #endif
 
 #ifndef BARE_USE_CYCLE_COUNTER
-#define BARE_USE_CYCLE_COUNTER 0
+#define BARE_USE_CYCLE_COUNTER 1
 #endif
 
 // ---------------------------------------------------------------------------
@@ -90,12 +99,14 @@ static unsigned char bare_heap[BARE_HEAP_BYTES];
 static size_t bare_heap_offset = 0;
 
 static void panic(const char *msg) {
-    printf("[bare] PANIC: %s\n", msg);
+    print_uart("[bare] PANIC: ");
+    print_uart(msg);
+    print_uart("\n");
     exit(1);
 }
 
 static void *bare_alloc(size_t size, size_t alignment) {
-    if (alignment == 0) alignment = 8;
+    if (alignment == 0) alignment = BARE_ALLOC_ALIGN;
     size_t misalignment = bare_heap_offset % alignment;
     if (misalignment != 0) bare_heap_offset += alignment - misalignment;
     if (bare_heap_offset + size > BARE_HEAP_BYTES) panic("bare heap exhausted");
@@ -106,14 +117,18 @@ static void *bare_alloc(size_t size, size_t alignment) {
 
 void *malloc(size_t size) {
     if (size == 0) size = 1;
-    return bare_alloc(size, 8);
+    return bare_alloc(size, BARE_ALLOC_ALIGN);
 }
 
 void *calloc(size_t count, size_t size) {
-    if (count == 0 || size == 0) return bare_alloc(1, 8);
+    if (count == 0 || size == 0) return bare_alloc(1, BARE_ALLOC_ALIGN);
     size_t total = count * size;
-    void *ptr = bare_alloc(total, 8);
-    memset(ptr, 0, total);
+    void *ptr = bare_alloc(total, BARE_ALLOC_ALIGN);
+    // Zero out the memory
+    unsigned char *p = (unsigned char *)ptr;
+    for (size_t i = 0; i < total; i++) {
+        p[i] = 0;
+    }
     return ptr;
 }
 
@@ -123,7 +138,9 @@ void free(void *ptr) { (void)ptr; }
 #if BARE_USE_CYCLE_COUNTER
 static inline uint64_t rdcycle(void) {
     uint64_t c;
-    __asm__ volatile ("rdcycle %0" : "=r"(c));
+    // Use machine-mode counter CSR to avoid requiring Zicntr (cycle/time/instret)
+    // in the Spike --isa string.
+    __asm__ volatile ("csrr %0, mcycle" : "=r"(c));
     return c;
 }
 
@@ -155,6 +172,28 @@ static inline int is_whitespace(unsigned char c) {
 static inline int abs_int(int v) { return v < 0 ? -v : v; }
 
 static inline float bare_fabsf(float x) { return x < 0.0f ? -x : x; }
+
+// ---------------------------------------------------------------------------
+// Trap handler override (crt.S provides a weak one that exits with -32)
+// Print basic trap info to help debug early failures under Spike.
+static inline uintptr_t read_csr_mtval(void) {
+    uintptr_t v;
+    __asm__ volatile ("csrr %0, mtval" : "=r"(v));
+    return v;
+}
+
+uintptr_t handle_trap(uintptr_t cause, uintptr_t epc, uintptr_t regs[32]) {
+    (void)regs;
+    print_uart("[trap] mcause=0x");
+    print_uart_hex((unsigned long long)cause);
+    print_uart(" mepc=0x");
+    print_uart_hex((unsigned long long)epc);
+    print_uart(" mtval=0x");
+    print_uart_hex((unsigned long long)read_csr_mtval());
+    print_uart("\r\n");
+    exit(1);
+    return epc;
+}
 
 float sqrtf(float x) {
     return __builtin_sqrtf(x);
@@ -320,14 +359,68 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
     for (int j = 0; j < size; j++) o[j] = weight[j] * (ss * x[j]);
 }
 
+void softmax(float* x, int size) {
+    float max_val = x[0];
+    for (int i = 1; i < size; i++) if (x[i] > max_val) max_val = x[i];
+    float sum = 0.0f;
+    for (int i = 0; i < size; i++) {
+        x[i] = expf(x[i] - max_val);
+        sum += x[i];
+    }
+    float inv = 1.0f / sum;
+    for (int i = 0; i < size; i++) x[i] *= inv;
+}
+
+
 // softmax implementation moved to riscv_vector_kernels.h
 
 void matmul(float* xout, float* x, float* w, int n, int d) {
+    // for (int i = 0; i < d; i++) {
+    //     float val = 0.0f;
+    //     float* row = w + i * n;
+    //     for (int j = 0; j < n; j++) val += row[j] * x[j];
+    //     xout[i] = val;
+    // }
+    print_uart("Matmul input x: \r\n");
+    for (int k = 0; k < n; k++) { // 循环 n 次，打印所有元素
+        print_uart_float(x[k]);
+        print_uart(" ");
+        if ((k + 1) % 7 == 0) print_uart("\r\n");
+    }
+    print_uart("\r\n");
+    matmul_vector2(xout, x, w, n, d);
+
+    int err_cnt = 0;
     for (int i = 0; i < d; i++) {
         float val = 0.0f;
         float* row = w + i * n;
         for (int j = 0; j < n; j++) val += row[j] * x[j];
-        xout[i] = val;
+        
+        float diff = bare_fabsf(val - xout[i]);
+
+        if (diff > 0.0001f) {
+            if (err_cnt == 0) {
+                print_uart("Matmul Error. Shape: W["); print_uart_int_dec(d);
+                print_uart("x"); print_uart_int_dec(n);
+                print_uart("] * x["); print_uart_int_dec(n);
+                print_uart("]\r\n");
+            }
+            if (err_cnt < 5) {
+                // print_uart("ERR: matmul idx="); print_uart_int_dec(i);
+                // print_uart(" s="); print_uart_float(val);
+                // print_uart(" v="); print_uart_float(xout[i]);
+                // print_uart("\r\n");
+            }
+            err_cnt++;
+        }
+        print_uart("matmul idx="); print_uart_int_dec(i);
+        print_uart(" s="); print_uart_float(val);
+        print_uart(" v="); print_uart_float(xout[i]);
+        print_uart("\r\n");
+    }
+    if (err_cnt > 0) {
+        print_uart("Matmul errors: "); print_uart_int_dec(err_cnt); print_uart("\r\n");
+        exit(1);
     }
 }
 
@@ -346,7 +439,11 @@ float* forward(Transformer* transformer, int token, int pos) {
     memcpy(x, content_row, dim * sizeof(*x));
 
     for (unsigned long long l = 0; l < p->n_layers; l++) {
+        // print_uart("Processing layer: ");
+        // print_uart_int_dec(l);
+        // print_uart("\r\n");
         rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+        // print_uart("RMSNorm 1 done\r\n");
         int loff = l * p->seq_len * kv_dim;
         float* layer_key_cache = s->key_cache + loff;
         float* layer_val_cache = s->value_cache + loff;
@@ -356,6 +453,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+        // print_uart("QKV matmul done\r\n");
 
         for (int i = 0; i < dim; i += 2) {
             float head_dim = (float)(i % head_size);
@@ -374,22 +472,52 @@ float* forward(Transformer* transformer, int token, int pos) {
                 s->k[i+1] = k0 * fci + k1 * fcr;
             }
         }
+        //print_uart("RoPE done\r\n");
 
         memcpy(k_slot, s->k, kv_dim * sizeof(float));
+        //print_uart("K-slot info: ");
+        //print_uart_int_dec((uintptr_t)k_slot);
+        //print_uart(" ");
+        //print_uart_int_dec((uintptr_t)s->k);
+        //print_uart(" ");
+        //print_uart_int_dec(kv_dim * sizeof(float));
+        //print_uart("\r\n");
+
         memcpy(v_slot, s->v, kv_dim * sizeof(float));
+        //print_uart("V-slot info: ");
+        //print_uart_int_dec((uintptr_t)v_slot);
+        //print_uart(" ");
+        //print_uart_int_dec((uintptr_t)s->v);
+        //print_uart(" ");
+        //print_uart_int_dec(kv_dim * sizeof(float));
+        //print_uart("\r\n");
+
+        //print_uart("KVCache done\r\n");
 
         for (int h = 0; h < p->n_heads; h++) {
+            //print_uart("Head ");
+            //print_uart_int_dec(h);
+            //print_uart(": ");
             float* q = s->q + h * head_size;
+            //print_uart("  q: "); print_uart_int_dec((uintptr_t)q); print_uart("\r\n");
             float* att = s->att + h * p->seq_len;
+            //print_uart("  att: "); print_uart_int_dec((uintptr_t)att); print_uart("\r\n");
             float scale = 1.0f / sqrtf((float)head_size);
+            //print_uart("  scale: "); print_uart_float(scale); print_uart("\r\n");
             for (int t = 0; t <= pos; t++) {
+                //print_uart("  t: "); print_uart_int_dec(t); print_uart("\r\n");
                 float* k = layer_key_cache + t * kv_dim + (h/kv_mul) * head_size;
+                //print_uart("    k: "); print_uart_int_dec((uintptr_t)k); print_uart("\r\n");
                 float score = 0.0f;
                 for (int i = 0; i < head_size; i++) score += q[i] * k[i];
+                //print_uart("    score: "); print_uart_float(score); print_uart("\r\n");
                 att[t] = score * scale;
+                //print_uart("    att[t]: "); print_uart_float(att[t]); print_uart("\r\n");
             }
+            //print_uart("Scores ");
             for (int t = pos + 1; t < p->seq_len; t++) att[t] = -1e9f;
             softmax(att, pos + 1);
+            //print_uart("Softmax ");
             float* xb = s->xb + h * head_size;
             for (int i = 0; i < head_size; i++) xb[i] = 0.0f;
             for (int t = 0; t <= pos; t++) {
@@ -397,25 +525,38 @@ float* forward(Transformer* transformer, int token, int pos) {
                 float* v = layer_val_cache + t * kv_dim + (h/kv_mul) * head_size;
                 for (int i = 0; i < head_size; i++) xb[i] += att_t * v[i];
             }
+            //print_uart("Accum\r\n");
             }
+            //print_uart("Attention done\r\n");
 
             matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
-            for (int i = 0; i < dim; i++) x[i] = x[i] + s->xb2[i];
-
+            //print_uart("Output proj done\r\n");
+            for (int i = 0; i < dim; i++) x[i] = x[i] + s->xb2[i];//TODO
+            //print_uart("Residual 1 done\r\n");
             rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+            //print_uart("RMSNorm 2 done\r\n");
             matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
             matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+            //print_uart("FFN Gate/Up done\r\n");
             for (int i = 0; i < hidden_dim; i++) {
                 float val = s->hb[i];
                 val *= 1.0f / (1.0f + expf(-val));
                 s->hb[i] = val * s->hb2[i];
             }
+            //print_uart("SwiGLU done\r\n");
             matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
+            //print_uart("FFN Down done\r\n");
             for (int i = 0; i < dim; i++) x[i] = x[i] + s->xb[i];
+            //print_uart("Residual 2 done\r\n");
         }
-
+        //print_uart("Layer done");
+        //print_uart("\r\n");
         rmsnorm(x, x, w->rms_final_weight, dim);
+        //print_uart("Final RMSNorm done\r\n");
         matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+        //print_uart("Classifier done\r\n");
+        //print_uart("Model done");
+        //print_uart("\r\n");
         return s->logits;
     }
 
@@ -606,7 +747,7 @@ void safe_printf(char *piece) {
         unsigned char byte_val = piece[0];
         if (!(is_printable(byte_val) || is_whitespace(byte_val))) return;
     }
-    printf("%s", piece);
+    print_uart(piece);
 }
 
 // ---------------------------------------------------------------------------
@@ -649,11 +790,20 @@ int sample_argmax(float* probabilities, int n) {
 }
 
 int sample_mult(float* probabilities, int n, float coin) {
+    //print_uart("sample_mult enter\r\n");
     float cdf = 0.0f;
     for (int i = 0; i < n; i++) {
         cdf += probabilities[i];
-        if (coin < cdf) return i;
+        if (coin < cdf) {
+            // print_uart("sample_mult hit: ");
+            // print_uart_int_dec(i);
+            // print_uart(" cdf: ");
+            // print_uart_float(cdf);
+            // print_uart("\r\n");
+            return i;
+        }
     }
+    //print_uart("sample_mult fallback to last\r\n");
     return n - 1;
 }
 
@@ -669,6 +819,7 @@ void build_sampler(Sampler* sampler, int vocab_size, float temperature, float to
 void free_sampler(Sampler* sampler) { free(sampler->probindex); }
 
 int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, float coin) {
+    //print_uart("sample_topp enter\r\n");
     int n0 = 0;
     const float cutoff = (1.0f - topp) / (n - 1);
     for (int i = 0; i < n; i++) {
@@ -678,6 +829,8 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, f
             n0++;
         }
     }
+    //print_uart("sample_topp n0: "); print_uart_int_dec(n0); print_uart("\r\n");
+
     for (int i = 1; i < n0; i++) {
         ProbIndex key = probindex[i];
         int j = i - 1;
@@ -693,12 +846,19 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, f
         cumulative += probindex[i].prob;
         if (cumulative > topp) { last = i; break; }
     }
+    // print_uart("sample_topp cumulative: "); print_uart_float(cumulative); 
+    // print_uart(" last: "); print_uart_int_dec(last); print_uart("\r\n");
+
     float r = coin * cumulative;
     float cdf = 0.0f;
     for (int i = 0; i <= last; i++) {
         cdf += probindex[i].prob;
-        if (r < cdf) return probindex[i].index;
+        if (r < cdf) {
+            //print_uart("sample_topp selected: "); print_uart_int_dec(probindex[i].index); print_uart("\r\n");
+            return probindex[i].index;
+        }
     }
+    //print_uart("sample_topp fallback: "); print_uart_int_dec(probindex[last].index); print_uart("\r\n");
     return probindex[last].index;
 }
 
@@ -709,7 +869,9 @@ int sample_token(Sampler* sampler, float* logits) {
     } else {
         for (int q=0; q<sampler->vocab_size; q++) logits[q] /= sampler->temperature;
         softmax(logits, sampler->vocab_size);
+        //print_uart("Softmax (sampling) done\r\n");
         float coin = random_f32(&sampler->rng_state);
+        //print_uart("Coin: "); print_uart_float(coin); print_uart("\r\n");
         if (sampler->topp <= 0 || sampler->topp >= 1) {
             next = sample_mult(logits, sampler->vocab_size, coin);
         } else {
@@ -730,37 +892,111 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 
 #if BARE_USE_CYCLE_COUNTER
     uint64_t start_cycles = 0;
+    uint64_t ttft_start = rdcycle();
+    uint64_t ttft_end = 0;
 #endif
     int token = prompt_tokens[0];
     int pos = 0;
+    int line_char_count = 0;
+    char word_buffer[256];
+    int word_len = 0;
     while (pos < steps) {
         float* logits = forward(transformer, token, pos);
         int next;
+        // print_uart("next token logits computed");
+        // print_uart("\r\n");
         if (pos < num_prompt_tokens - 1) {
             next = prompt_tokens[pos + 1];
         } else {
             next = sample_token(sampler, logits);
+#if BARE_USE_CYCLE_COUNTER
+            if (ttft_end == 0) ttft_end = rdcycle();
+#endif
         }
         pos++;
         if (next == 1) break;
         char* piece = decode(tokenizer, token, next);
-        safe_printf(piece);
+
+        if (piece) {
+            int should_print = 1;
+            if (piece[0] == '\0') should_print = 0;
+            else if (piece[1] == '\0') {
+                unsigned char byte_val = piece[0];
+                if (!(is_printable(byte_val) || is_whitespace(byte_val))) should_print = 0;
+            }
+
+            if (should_print) {
+                for (char *c = piece; *c != '\0'; c++) {
+                    if (is_whitespace((unsigned char)*c)) {
+                        if (word_len > 0) {
+                            if (line_char_count + word_len > 40) {
+                                print_uart("\r\n");
+                                line_char_count = 0;
+                            }
+                            for (int i = 0; i < word_len; i++) write_serial((uint8_t)word_buffer[i]);
+                            line_char_count += word_len;
+                            word_len = 0;
+                        }
+                        if (*c == '\n' || *c == '\r') {
+                            print_uart("\r\n");
+                            line_char_count = 0;
+                        } else {
+                            if (line_char_count >= 40) {
+                                print_uart("\r\n");
+                                line_char_count = 0;
+                            } else {
+                                write_serial((uint8_t)*c);
+                                line_char_count++;
+                            }
+                        }
+                    } else {
+                        if (word_len < 255) {
+                            word_buffer[word_len++] = *c;
+                        } else {
+                            if (line_char_count + word_len > 40) {
+                                print_uart("\r\n");
+                                line_char_count = 0;
+                            }
+                            for (int i = 0; i < word_len; i++) write_serial((uint8_t)word_buffer[i]);
+                            line_char_count += word_len;
+                            word_len = 0;
+                            word_buffer[word_len++] = *c;
+                        }
+                    }
+                }
+            }
+        }
+
         token = next;
 #if BARE_USE_CYCLE_COUNTER
         if (start_cycles == 0) start_cycles = rdcycle();
 #endif
     }
-    printf("\n");
+    if (word_len > 0) {
+        if (line_char_count + word_len > 40) print_uart("\r\n");
+        for (int i = 0; i < word_len; i++) write_serial((uint8_t)word_buffer[i]);
+    }
+    print_uart("\r\n");
 #if BARE_USE_CYCLE_COUNTER
     if (start_cycles != 0) {
         uint64_t end_cycles = rdcycle();
         long ms = cycles_to_ms(start_cycles, end_cycles);
         if (ms > 0 && pos > 1) {
             float tok_s = (float)(pos-1) / (ms / 1000.0f);
-            printf("[bare] tok/s: %f\n", tok_s);
+            print_uart("[bare] tok/s: ");
+            print_uart_float(tok_s);
+            print_uart("\r\n");
         } else {
-            printf("[bare] cycles: %llu\n", (unsigned long long)(end_cycles - start_cycles));
+            print_uart("[bare] cycles: ");
+            print_uart_int_dec((unsigned long long)(end_cycles - start_cycles));
+            print_uart("\r\n");
         }
+    }
+    if (ttft_end != 0) {
+        long ttft_ms = cycles_to_ms(ttft_start, ttft_end);
+        print_uart("[bare] TTFT: ");
+        print_uart_int_dec((uint64_t)ttft_ms);
+        print_uart(" ms\r\n");
     }
 #endif
     free(prompt_tokens);
@@ -768,23 +1004,30 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 
 // ---------------------------------------------------------------------------
 int main(void) {
-    // Enable VS extension (bits 9-10 of mstatus)
-    // VS: 0 = Off, 1 = Initial, 2 = Clean, 3 = Dirty
-    // We set it to 1 (Initial) -> 0x200
+    // Enable vector (VS, bits 9-10) and floating-point (FS, bits 13-14)
+    // state in mstatus. Some bare-metal environments start with FS/VS=Off,
+    // which would trap on the first FP/V instruction.
     unsigned long mstatus;
     asm volatile("csrr %0, mstatus" : "=r"(mstatus));
-    mstatus |= 0x200; 
+    mstatus |= (3UL << 9);   // VS=Dirty
+    mstatus |= (3UL << 13);  // FS=Dirty
     asm volatile("csrw mstatus, %0" :: "r"(mstatus));
 
-    printf("[bare] model bytes: %llu\n", (unsigned long long)embedded_model_size());
-    printf("[bare] tokenizer bytes: %llu\n", (unsigned long long)embedded_tokenizer_size());
-
+    init_uart(CLOCK_FREQUENCY, UART_BITRATE);
+    print_uart("[bare] model bytes: ");
+    print_uart_int_dec((unsigned long long)embedded_model_size());
+    print_uart("\r\n");
+    print_uart("[bare] tokenizer bytes: ");
+    print_uart_int_dec((unsigned long long)embedded_tokenizer_size());
+    print_uart("\r\n");
+    print_uart("Initializing transformer...\r\n");
     Transformer transformer;
     init_transformer_from_embedded(&transformer);
-
+    print_uart("Transformer initialized.\r\n");
+    print_uart("Building tokenizer...\r\n");
     Tokenizer tokenizer;
     build_tokenizer_from_embedded(&tokenizer, transformer.config.vocab_size);
-
+    print_uart("Tokenizer built.\r\n");
     Sampler sampler;
     build_sampler(&sampler, transformer.config.vocab_size, BARE_TEMPERATURE, BARE_TOPP, BARE_SEED);
 
@@ -796,6 +1039,6 @@ int main(void) {
     free_tokenizer(&tokenizer);
     free_transformer(&transformer);
 
-    printf("[bare] done.\n");
+    print_uart("[bare] done.\r\n");
     return 0;
 }

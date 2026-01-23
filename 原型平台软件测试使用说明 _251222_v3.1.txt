@@ -1,0 +1,44 @@
+#####################################################
+######## AICPU FPGA-1902 原型平台软件测试使用说明 #######
+#####################################################
+1.使用SDK中提供的API构建软件测试程序（xxx.bin）
+2.打开4个终端（终端1、2、3、4），其中终端2、3、4ssh到FPGA服务器
+    ssh hjuser@172.38.9.112（密码：hejian）
+	首次使用请通过终端2拷贝一份工作目录 cp -r /home/hjuser/Desktop/AICPU /home/hjuser/Desktop/AICPU_xxx(用户名)
+3.在终端1中将测试程序通过scp传到FPGA服务器
+	scp xxx.bin路径（上传到项目组服务器的测试程序） hjuser@172.38.9.112:/home/hjuser/Desktop/AICPU_xxx/test
+4.在终端2中对xxx.bin文件进行padding得到test.bin文件
+	cd /home/hjuser/Desktop/AICPU_xxx/test
+	./pad_to_fixed.sh xxx.bin test.bin
+5.在终端4中打开串口并保持挂起（用于数据打印和输入）
+	minicom -D /dev/FPGAx （x为分配的串口编号，如FPGA0）
+	ctrl+A -> Z -> E (打开回显)
+6.在终端3中烧写软件程序
+	cd /home/hjuser/Desktop/AICPU_xxx
+	make uv_runx（进入烧写软件并完成第一次烧写，x为分配的FPGA编号，如uv_run0）
+	后续程序重新烧写请严格按照以下顺序输入
+		reset -name cpu_reset -value 1  (暂停并复位CPU)
+		writemem -rtl ariane_xilinx.i_ddr\[131071:0\] -file ./test/test.bin -file_type bin  (烧写程序，可根据需求跳过)
+		reset -name cpu_reset -value 0  (启动CPU)
+	完成调试后，如需退出烧写软件
+		exit
+
+
+
+FPGA编号和串口编号对应表（共8套设备，每套1台FPGA+1个串口）
+#############################################
+|  序号	|  FPGA编号	|  串口编号	|    用途	|
+#############################################
+|	0	|	  0		|/dev/FPGA0 |  设备验收  |
+|	1	|	  1		|/dev/FPGA1	|  设备验收  |
+|	2	|	  2		|/dev/FPGA2 |  硬件测试  |
+|	3	|	  3		|/dev/FPGA3 |  硬件测试  |
+|	4	|	  4		|/dev/FPGA4 |  软件测试  |
+|	5	|	  5		|/dev/FPGA5 |  软件测试  |
+|	6	|	  6		|/dev/FPGA6 |  软件测试  |
+|	7	|	  7		|/dev/FPGA7 |  软件测试  |
+#############################################
+备注：
+1.用途为软件测试的设备均可使用（序号4~7，共4套设备）
+2.FPGA编号和串口编号需要严格依照上表对应使用
+3.每套设备仅支持1人同时使用，需多人同时使用请使用多套设备

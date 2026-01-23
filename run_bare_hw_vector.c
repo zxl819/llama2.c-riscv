@@ -10,6 +10,21 @@
 #include <stdbool.h>
 #include "riscv_vector_kernels.h"
 
+// ---------------------------------------------------
+// Optional: use RISC-V Matrix extension for FFN W1
+// Enable at compile-time:
+//   BARE_DEFS="-DUSE_MATRIX_W1=1" and link in matmul_matrix.c (kernel-only)
+#ifndef USE_MATRIX_W1
+#define USE_MATRIX_W1 0
+#endif
+
+#if USE_MATRIX_W1
+// Provided by matmul_matrix.c (compiled with clang Matrix toolchain).
+// Computes C[m*n] = A[m*k] * B[k*n] using int8 inputs, int32 accumulation.
+extern int matmul_matrix_i8_i32(const int8_t *A, const int8_t *B, int32_t *C,
+                                int m, int n, int k);
+#endif
+
 // --- UART Implementation from test.c ---
 #define UART_BASE 0x10000000
 #define UART_RBR (UART_BASE + 0)
@@ -318,6 +333,14 @@ typedef struct {
     float *logits;
     float *key_cache;
     float *value_cache;
+
+#if USE_MATRIX_W1
+    // Scratch for Matrix-based W1 (reused across layers/steps)
+    int8_t *w1_q;      // [hidden_dim * dim]
+    float  *w1_s;      // [hidden_dim] per-row scale
+    int8_t *x_q;       // [dim] per-token scale (single)
+    int32_t *w1_out;   // [hidden_dim]
+#endif
 } RunState;
 
 typedef struct {
@@ -340,8 +363,21 @@ void malloc_run_state(RunState* s, Config* p) {
     s->logits = calloc(p->vocab_size, sizeof(float));
     s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
     s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+
+#if USE_MATRIX_W1
+    // Allocate scratch buffers for Matrix W1 path.
+    // Note: this can be large (hidden_dim * dim bytes for int8 weights).
+    s->w1_q = (int8_t*)calloc((size_t)p->hidden_dim * (size_t)p->dim, sizeof(int8_t));
+    s->w1_s = (float*)calloc((size_t)p->hidden_dim, sizeof(float));
+    s->x_q = (int8_t*)calloc((size_t)p->dim, sizeof(int8_t));
+    s->w1_out = (int32_t*)calloc((size_t)p->hidden_dim, sizeof(int32_t));
+#endif
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q || !s->k || !s->v ||
-        !s->att || !s->logits || !s->key_cache || !s->value_cache) {
+        !s->att || !s->logits || !s->key_cache || !s->value_cache
+#if USE_MATRIX_W1
+        || !s->w1_q || !s->w1_s || !s->x_q || !s->w1_out
+#endif
+    ) {
         panic("RunState allocation failed");
     }
 }
@@ -415,6 +451,63 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     }
 }
 
+#if USE_MATRIX_W1
+static inline int8_t clamp_i8(int v) {
+    if (v > 127) return (int8_t)127;
+    if (v < -127) return (int8_t)-127;
+    return (int8_t)v;
+}
+
+static float quantize_vector_i8_single_scale(const float *x, int n, int8_t *q) {
+    float max_abs = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float a = bare_fabsf(x[i]);
+        if (a > max_abs) max_abs = a;
+    }
+    float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+    float inv = 1.0f / scale;
+    for (int i = 0; i < n; i++) {
+        float v = x[i] * inv;
+        int iv = (int)(v + (v >= 0.0f ? 0.5f : -0.5f));
+        q[i] = clamp_i8(iv);
+    }
+    return scale;
+}
+
+static void quantize_matrix_rows_i8(const float *w, int rows, int cols, int8_t *q, float *row_scales) {
+    for (int r = 0; r < rows; r++) {
+        const float *row = w + (size_t)r * (size_t)cols;
+        float max_abs = 0.0f;
+        for (int c = 0; c < cols; c++) {
+            float a = bare_fabsf(row[c]);
+            if (a > max_abs) max_abs = a;
+        }
+        float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+        row_scales[r] = scale;
+        float inv = 1.0f / scale;
+        int8_t *qrow = q + (size_t)r * (size_t)cols;
+        for (int c = 0; c < cols; c++) {
+            float v = row[c] * inv;
+            int iv = (int)(v + (v >= 0.0f ? 0.5f : -0.5f));
+            qrow[c] = clamp_i8(iv);
+        }
+    }
+}
+
+static void matmul_w1_matrix(float *out, const float *x, const float *w1,
+                             int dim, int hidden_dim, RunState *s) {
+    // Quantize activation (single scale) and weights (per-row scale), run Matrix int8 GEMM,
+    // then dequantize with out[i] = acc_i32 * x_scale * w_scale[i].
+    float x_scale = quantize_vector_i8_single_scale(x, dim, s->x_q);
+    quantize_matrix_rows_i8(w1, hidden_dim, dim, s->w1_q, s->w1_s);
+    // C[hidden_dim x 1] = W1[hidden_dim x dim] * x[dim x 1]
+    (void)matmul_matrix_i8_i32(s->w1_q, s->x_q, s->w1_out, hidden_dim, 1, dim);
+    for (int i = 0; i < hidden_dim; i++) {
+        out[i] = (float)s->w1_out[i] * (x_scale * s->w1_s[i]);
+    }
+}
+#endif
+
 float* forward(Transformer* transformer, int token, int pos) {
     Config* p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
@@ -487,7 +580,11 @@ float* forward(Transformer* transformer, int token, int pos) {
             for (int i = 0; i < dim; i++) x[i] = x[i] + s->xb2[i];
 
             rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+#if USE_MATRIX_W1
+            matmul_w1_matrix(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim, s);
+#else
             matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+#endif
             matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
             for (int i = 0; i < hidden_dim; i++) {
                 float val = s->hb[i];

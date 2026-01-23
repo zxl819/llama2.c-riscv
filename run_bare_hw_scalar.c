@@ -110,7 +110,7 @@ size_t strlen(const char *s);
 #endif
 //"Once upon a time"
 #ifndef BARE_STEPS
-#define BARE_STEPS 128
+#define BARE_STEPS 64
 #endif
 
 #ifndef BARE_TEMPERATURE
@@ -858,7 +858,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
                 for (char *c = piece; *c != '\0'; c++) {
                     if (is_whitespace((unsigned char)*c)) {
                         if (word_len > 0) {
-                            if (line_char_count + word_len > 40) {
+                            if (line_char_count + word_len > 80) {
                                 print_uart("\r\n");
                                 line_char_count = 0;
                             }
@@ -870,7 +870,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
                             print_uart("\r\n");
                             line_char_count = 0;
                         } else {
-                            if (line_char_count >= 40) {
+                            if (line_char_count >= 80) {
                                 print_uart("\r\n");
                                 line_char_count = 0;
                             } else {
@@ -882,7 +882,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
                         if (word_len < 255) {
                             word_buffer[word_len++] = *c;
                         } else {
-                            if (line_char_count + word_len > 40) {
+                            if (line_char_count + word_len > 80) {
                                 print_uart("\r\n");
                                 line_char_count = 0;
                             }
@@ -902,7 +902,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 #endif
     }
     if (word_len > 0) {
-        if (line_char_count + word_len > 40) print_uart("\r\n");
+        if (line_char_count + word_len > 80) print_uart("\r\n");
         for (int i = 0; i < word_len; i++) write_serial((uint8_t)word_buffer[i]);
     }
     print_uart("\r\n");

@@ -16,8 +16,11 @@
 // #include "matrix_kernel_noblk.h"
 #include "matrix_kernel_1230.h"
 #include "matrix_kernel_noblk_1231.h"
-#define CLOCK_FREQUENCY 1000000000
+#define CLOCK_FREQUENCY 50000000
 #define UART_BITRATE    115200
+
+#define BARE_MEM_STATS 1
+
 
 // Keep -O1 for the overall build, but prevent Clang from auto-vectorizing
 // generic code paths (e.g. tokenizer sorting) into RVV instructions.
@@ -279,9 +282,9 @@ uintptr_t handle_trap(uintptr_t cause, uintptr_t epc, uintptr_t regs[32]) {
 #endif
 
 #ifndef BARE_HEAP_BYTES
-#define BARE_HEAP_BYTES (256 * 1024 * 1024)
+#define BARE_HEAP_BYTES (22 * 1024 * 1024)
 #endif
-
+// 原本256MB的堆，现在改为24MB
 #ifndef BARE_CPU_HZ
 #define BARE_CPU_HZ CLOCK_FREQUENCY
 #endif
@@ -312,6 +315,7 @@ extern const unsigned char MODEL_BIN_START[];
 extern const unsigned char MODEL_BIN_END[];
 extern const unsigned char TOKENIZER_BIN_START[];
 extern const unsigned char TOKENIZER_BIN_END[];
+extern char _end[]; // Linker symbol for end of BSS
 
 static inline size_t embedded_model_size(void) {
     return (size_t)(MODEL_BIN_END - MODEL_BIN_START);
@@ -325,6 +329,63 @@ static inline size_t embedded_tokenizer_size(void) {
 // Tiny bump allocator for bare-metal use
 static unsigned char bare_heap[BARE_HEAP_BYTES];
 static size_t bare_heap_offset = 0;
+
+// ---------------------------------------------------------------------------
+// Memory usage stats helpers
+#if BARE_MEM_STATS
+static uintptr_t initial_sp = 0;
+#define STACK_FILL_PATTERN 0x55
+
+static void paint_stack(void) {
+    uintptr_t sp;
+    asm volatile("mv %0, sp" : "=r"(sp));
+    initial_sp = sp;
+    
+    // We assume stack grows down towards _end.
+    // Safety gap of 4KB from _end
+    uintptr_t stack_bottom = (uintptr_t)_end + 4096;
+    
+    // Paint if we have space
+    if (sp > stack_bottom) {
+        // Leave 256 bytes safety below current sp
+        size_t len = (sp - 256) - stack_bottom;
+        memset((void*)stack_bottom, STACK_FILL_PATTERN, len);
+    }
+}
+
+static size_t get_stack_usage(void) {
+    if (initial_sp == 0) return 0;
+    uintptr_t stack_bottom = (uintptr_t)_end + 4096;
+    unsigned char *p = (unsigned char *)stack_bottom;
+    uintptr_t current_sp;
+    asm volatile("mv %0, sp" : "=r"(current_sp));
+    
+    // Scan upwards for first non-pattern byte or reaching current sp
+    // (limit scan to initial_sp to avoid overrun)
+    while ((uintptr_t)p < initial_sp && *p == STACK_FILL_PATTERN) {
+        p++;
+    }
+    return (size_t)(initial_sp - (uintptr_t)p);
+}
+
+static void print_memory_stats(void) {
+    init_uart(CLOCK_FREQUENCY, UART_BITRATE);
+    print_uart("\r\n[bare] Memory Stats:\r\n");
+    
+    // Heap
+    print_uart("  Heap Used:  ");
+    print_uart_int_dec((unsigned long long)bare_heap_offset);
+    print_uart(" / ");
+    print_uart_int_dec((unsigned long long)BARE_HEAP_BYTES);
+    print_uart(" bytes\r\n");
+    
+    // Stack
+    size_t stack_used = get_stack_usage();
+    print_uart("  Stack Used: ");
+    print_uart_int_dec((unsigned long long)stack_used);
+    print_uart(" bytes (approx)\r\n");
+}
+#endif
 
 static void panic(const char *msg) {
     init_uart(CLOCK_FREQUENCY, UART_BITRATE);
@@ -1396,6 +1457,9 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
                 }
             }
         }
+            #if BARE_MEM_STATS
+            print_memory_stats();
+            #endif
         token = next;
 #if BARE_USE_CYCLE_COUNTER
         if (start_cycles == 0) start_cycles = rdcycle();
@@ -1429,12 +1493,18 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 
 // ---------------------------------------------------------------------------
 int main(void) {
+    #if BARE_MEM_STATS
+    paint_stack();
+    #endif
     enable_rvv_state();
 // #if BARE_USE_CYCLE_COUNTER
 //     g_bare_boot_cycles = rdcycle();
 // #endif
 
     init_uart(CLOCK_FREQUENCY, UART_BITRATE);
+    #if BARE_MEM_STATS
+    print_memory_stats();
+    #endif
     print_uart("[bare] model bytes: ");
     print_uart_int_dec((uint64_t)embedded_model_size());
     print_uart("\r\n");
@@ -1458,11 +1528,17 @@ int main(void) {
     static char prompt[] = BARE_PROMPT;
     int steps = BARE_STEPS;
     generate(&transformer, &tokenizer, &sampler, prompt, steps);
+    #if BARE_MEM_STATS
+    print_memory_stats();
+    #endif
 
     free_sampler(&sampler);
     free_tokenizer(&tokenizer);
     free_transformer(&transformer);
 
+    #if BARE_MEM_STATS
+    print_memory_stats();
+    #endif
     print_uart("[bare] done.\r\n");
     return 0;
 }
