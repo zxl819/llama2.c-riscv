@@ -1,14 +1,24 @@
+/*
+---
+title: 块缩放量化矩阵乘测试 (AME + RVV)
+date: 2026-01-29
+description: 模拟 LLM 推理中的量化矩阵乘加，结合了 AME (矩阵指令) 处理 int8 乘法和 RVV (向量指令) 处理浮点缩放。
+author: zhaoxinlei
+version: 1.0
+---
+============================================================================================================================================================
+代码说明
+============================================================================================================================================================
+该测试例实现了典型的“块缩放量化 (Block-scaled Quantized)”矩阵乘法。
+核心逻辑：
+1. 量化：将浮点输入按 32 (GS) 为一组进行量化，生成 int8 权重/激活值以及对应的 float32 缩放系数 (scale)。
+2. 矩阵乘法：调用 matrix_kernel_qmatmul_f32_noblk，内部使用 mqma.b.mm 指令在硬件中执行 int8 * int8 -> int32。
+3. 反量化：利用 RVV 指令（vfmul, vfadd）将 int32 结果转回 float32 并乘以此前保存的 group 缩放系数。
+4. 验证：通过 rng_f32_signed() 生成确定性随机数作为输入，对比硬件输出与纯 C 参考实现的正确性。
+============================================================================================================================================================
+*/
+
 // Minimal bare-metal correctness test for matrix_kernel_qmatmul_f32
-//
-// Build (example):
-//   make rvbareclang RV_BARE_APP=./test_matrix_kernel_qmatmul_f32.c \
-//     RV_BARE_NAME=./test_matrix_kernel_qmatmul_f32 BARE_PLATFORM=fpga PRINT_WAY=uart \
-//     BARE_EMBED_BLOBS=0 RV_BARE_CLANG=~/newllvm/test_llvm/build/bin/clang \
-//     CFLAGS+='-O1 -DMATRIX_KERNEL_DEBUG_PRINT=0 -DMATRIX_KERNEL_DEBUG_PRINT_EVERY=0'
-//
-// Notes:
-// - This test assumes the platform supports the Matrix extension used by matrix_kernel.h.
-// - It avoids libm; only uses basic float ops.
 
 #include <stdint.h>
 #include <stddef.h>
@@ -136,12 +146,15 @@ static void ref_qmatmul_f32(float *out,
     const int num_groups = (n + gs - 1) / gs;
     const int groups_per_row = n / gs;
 
-    for (int i = 0; i < d; i++) {
-        float accf = 0.0f;
-        for (int g = 0; g < num_groups; g++) {
-            const int base = g * gs;
-            const int count = (base + gs <= n) ? gs : (n - base);
+    // Initialize output to zero to match kernel behavior
+    for (int i = 0; i < d; i++) out[i] = 0.0f;
 
+    for (int g = 0; g < num_groups; g++) {
+        const int base = g * gs;
+        const int count = (base + gs <= n) ? gs : (n - base);
+        const float xscale = xs[g];
+
+        for (int i = 0; i < d; i++) {
             int32_t acc = 0;
             const int8_t *wrow = wq + (ptrdiff_t)i * (ptrdiff_t)n + (ptrdiff_t)base;
             const int8_t *xvec = xq + (ptrdiff_t)base;
@@ -150,10 +163,21 @@ static void ref_qmatmul_f32(float *out,
             }
 
             const float wscale = ws[(ptrdiff_t)i * (ptrdiff_t)groups_per_row + (ptrdiff_t)g];
-            const float xscale = xs[g];
-            accf += ((float)acc) * wscale * xscale;
+            out[i] += ((float)acc) * wscale * xscale;
         }
-        out[i] = accf;
+
+        // Print intermediate values to match kernel's debug log
+        print_uart("  [ref_accum] accum_result chunk (group g=");
+        print_uart_int_dec(g); print_uart("):\r\n");
+        for (int i = 0; i < d; i++) {
+            if (i < 16 || i == d - 1) {
+                print_uart("    out["); print_uart_int_dec(i); print_uart("]=");
+                print_float_fixed3(out[i]);
+                print_uart("\r\n");
+            } else if (i == 16) {
+                print_uart("    ...\r\n");
+            }
+        }
     }
 }
 
@@ -253,13 +277,13 @@ int main(void) {
     static float x[N] __attribute__((aligned(64)));
     static float w[D * N] __attribute__((aligned(64)));
 
-    static int8_t xq[N] __attribute__((aligned(64)));
-    static float xs[(N + GS - 1) / GS] __attribute__((aligned(64)));
+    static int8_t xq[N] __attribute__((section(".uncached_buffer"), aligned(64)));
+    static float xs[(N + GS - 1) / GS] __attribute__((section(".uncached_buffer"), aligned(64)));
 
-    static int8_t wq[D * N] __attribute__((aligned(64)));
-    static float ws[(D * N + GS - 1) / GS] __attribute__((aligned(64)));
+    static int8_t wq[D * N] __attribute__((section(".uncached_buffer"), aligned(64)));
+    static float ws[(D * N + GS - 1) / GS] __attribute__((section(".uncached_buffer"), aligned(64)));
 
-    static float out[D] __attribute__((aligned(64)));
+    static float out[D] __attribute__((section(".uncached_buffer"), aligned(64)));
     //__attribute__((section(".matNOLOAD"), aligned(64))) static
     static float ref[D] __attribute__((aligned(64)));
 

@@ -1,21 +1,129 @@
+/*
+---
+title: Softmax RVV 算子实现 (LMUL=1)
+date: 2026-01-29
+description: 基于 RISC-V Vector (RVV) 扩展实现的稳定版 Softmax 算子，采用 LMUL=1 配置，并针对裸机环境避开了标量浮点寄存器依赖。
+author: zhaoxinlei
+version: 1.0
+---
+============================================================================================================================================================
+代码说明
+============================================================================================================================================================
+公式：softmax(x_i) = exp(x_i - x_max) / sum_j{ exp(x_j - x_max) }
+算法：
+1. 计算全局最大值 m（逐块用 vsetvl 读取向量并做向量归约 vfredmax）。
+2. 对每个元素 x_i 减去 m，然后计算 exp(x_i - m)。注意：RVV 没有标准硬件向量 exp，通常两种策略：
+    实现向量化近似 exp (使用 Horner 8阶多项式拟合，具有较高的运行效率)。
+3. 对 exp 值做向量归约求和（vfredosum）。
+4. 计算 1/sum (使用 vfrec7 估算 + Newton-Raphson 迭代)，将每个 exp 乘以倒数得到最终结果。
+LMUL=1 优化点：
+    使用 e32m1（LMUL=1），在 VLEN=512 时每个向量寄存器包含 16 个 e32 元素。
+    - 针对裸机 CRT 限制，归约结果通过内存交换再广播（vrgather），避免标量浮点寄存器操作。
+    - 向量化处理阶数，保证在不同分块长度（avl）下的正确性。
+============================================================================================================================================================
+*/ 
 #define VLEN 512
-#include "riscv_vector.h"
-#include <stdint.h>
-#include <stddef.h>
+#include <riscv_vector.h>
+#define INFINITY (__builtin_inff())
+#include <stdio.h>
+#include <string.h>
+#include "data_softmax.h"
+#include "uart_helper.c"
 
+#define CLOCK_FREQUENCY 25000000 //50MHz
+#define UART_BITRATE    115200  
+
+// 日志缓冲：先存到内存，再延迟打印
+#ifndef LOG_MAX
+#define LOG_MAX N
+#endif
+
+__attribute__((section(".logbuf"), aligned(64))) static volatile float   g_log_max_x;
+__attribute__((section(".logbuf"), aligned(64))) static volatile float   g_log_sum_raw;
+__attribute__((section(".logbuf"), aligned(64))) static volatile float   g_log_sum_eps;
+
+
+__attribute__((section(".logbuf"), aligned(64))) static volatile int32_t g_log_pos[LOG_MAX];
+__attribute__((section(".logbuf"), aligned(64))) static volatile float   g_log_exp0[LOG_MAX];
+__attribute__((section(".logbuf"), aligned(64))) static volatile float   g_log_blk_sum[LOG_MAX];
+__attribute__((section(".logbuf"), aligned(64))) static volatile int32_t g_log_norm_pos[LOG_MAX];
+__attribute__((section(".logbuf"), aligned(64))) static volatile float   g_log_norm_dst0[LOG_MAX];
+static int g_log_norm_cnt = 0;
+static int g_log_cnt = 0;
+
+// 简单的空转延时函数，使用 asm volatile 防止被优化掉
 static inline void debug_delay_cycles(unsigned cycles) {
-    for (unsigned i = 0; i < cycles; ++i) {
-        asm volatile("nop");
-    }
+  for (unsigned i = 0; i < cycles; ++i) {
+    asm volatile("nop");
+  }
 }
 
-// Helper to load float as bits without type punning issues
-// static inline uint32_t load_f32_bits(const float* p) {
-//    uint32_t u; memcpy(&u, p, 4); return u;
-// }
+static inline void enable_vector_and_fpu(void) {
+        // Set mstatus.VS=11 and mstatus.FS=11 so vector/FPU instructions won't trap.
+        // 0x6600 sets VS[10:9]=3 and FS[14:13]=3.
+        register unsigned long x = 0x6600;
+        asm volatile("csrs mstatus, %0" :: "r"(x) : "memory");
+}
 
-// Global debug/log buffers removed or commented out for integration
 
+// Compare helper that only uses uart_helper.c output routines.
+static void compare_and_print(const float* got, const float* ref, int n, float tol) {
+    int mism = 0;
+    float max_err = 0.0f;
+    int max_idx = -1;
+
+    print_uart("detail:\r\n");
+    for (int i = 0; i < n; ++i) {
+        float d = my_fabs(got[i] - ref[i]);
+        if (d > max_err) { max_err = d; max_idx = i; }
+
+        // 逐项打印（无论是否越界）
+        print_idx_prefix("i", i);
+        print_uart(" got=");  print_float_fixed3(got[i]);
+        print_uart(" ref=");  print_float_fixed3(ref[i]);
+        print_uart(" diff="); print_float_fixed3(d);
+        if (d > tol) { print_uart(" FAIL"); ++mism; }
+        else         { print_uart(" OK"); }
+        print_uart("\r\n");
+    }
+
+    // 汇总
+    print_uart("summary: mismatches=");
+    print_dec32(mism);
+    print_uart(" max_err@");
+    print_dec32(max_idx);
+    print_uart("=");
+    print_float_fixed3(max_err);
+    print_uart("\r\n");
+}
+// ========== softmax 相关 ==========
+#if 1
+static inline uint32_t load_f32_bits(const float* p) {
+    uint32_t u; memcpy(&u, p, 4); return u;
+}
+
+void softmax_stable_rvv_fp32(float* dst, const float* src, size_t n);
+float quick_dirty_vector_expf(float* dst, float* src, float max_x, size_t n);
+uint32_t quick_dirty_vector_expf_no_scalar(float* dst, float* src, uint32_t max_x_bits, size_t n);
+
+__attribute__((aligned(64))) float dst[N] = {0};
+__attribute__((aligned(64))) float diff_mem[N] = {0};
+
+int main(){
+   
+    init_uart(CLOCK_FREQUENCY, UART_BITRATE);
+    // 计算
+    print_uart("Softmax RVV LMUL=1 Test\r\n");
+    enable_vector_and_fpu();
+    print_uart("Initializing.....\r\n");
+    softmax_stable_rvv_fp32(dst, src, N);
+    debug_delay_cycles(1000000);
+    // 对比 golden（容差 1e-3）
+    print_uart("Compare vs golden:\r\n");
+    compare_and_print(dst, golden, N, 1e-3f);
+
+    return 0;
+}
 // 用内存作为 vrgather.vi 的输出
 static inline vfloat32m8_t asm_vrgather_vi_f32m8_mem(vfloat32m8_t src, int imm, size_t vl) {
     float buf[16] __attribute__((aligned(64))); // m8 最多16元素（VLEN=512）
@@ -375,3 +483,6 @@ void softmax_stable_rvv_fp32(float* dst, const float *src, size_t n)
 
    
 }
+
+#endif // softmax related
+

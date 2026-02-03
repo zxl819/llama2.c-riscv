@@ -198,7 +198,7 @@ def apply_excel_formatting(file_path):
 
 def main():
     # 输入文件路径
-    input_file = 'performance_scalar_stack.txt'
+    input_file = 'DDR_scalar.txt'
     
     # 检查文件是否存在
     if not os.path.exists(input_file):
@@ -206,7 +206,7 @@ def main():
         return
     
     # 输出文件路径
-    output_file = 'performance_analysis_scalar_stack.xlsx'
+    output_file = 'DDR_scalar.xlsx'
     
     print("开始解析性能日志文件...")
     

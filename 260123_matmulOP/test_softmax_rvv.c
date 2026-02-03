@@ -11,7 +11,7 @@
 
 #include "uart_helper.c"
 
-#define CLOCK_FREQUENCY 24000000
+#define CLOCK_FREQUENCY 50000000
 #define UART_BITRATE    115200
 
 // Declare the external RVV function
@@ -108,16 +108,16 @@ static inline float rng_f32_signed(void) {
 // Main Test
 
 #define MAX_N 1024
-static float input_buf[MAX_N] __attribute__((aligned(64)));
-static float ref_buf[MAX_N] __attribute__((aligned(64)));
-static float rvv_buf[MAX_N] __attribute__((aligned(64)));
+static float input_buf[MAX_N];
+static float ref_buf[MAX_N];
+static float rvv_buf[MAX_N];
 
 int main(void) {
     init_uart(CLOCK_FREQUENCY, UART_BITRATE);
     print_uart("\r\n=== Test Softmax RVV ===\r\n");
     enable_rvv_state();
 
-    int sizes[] = {1024};
+    int sizes[] = {1, 16, 32, 64, 127, 256, 517, 1024};
     int num_sizes = sizeof(sizes)/sizeof(sizes[0]);
     int errors = 0;
 
@@ -127,7 +127,7 @@ int main(void) {
 
         // Init Data
         for (int i = 0; i < n; i++) {
-            input_buf[i] = rng_f32_signed() * 3.0f; // Scale a bit
+            input_buf[i] = rng_f32_signed() * 2.0f; // Scale a bit
         }
 
         // Run Reference
@@ -143,17 +143,6 @@ int main(void) {
         // If src==dst it should work (pointers are just copied).
         // Let's test out-of-place correctness.
         softmax_stable_rvv_fp32(rvv_buf, input_buf, n);
-
-        print_uart("Head comparison (val*1e6):\r\n");
-        for (int i=0; i<n && i<16; ++i) {
-             print_uart("  i="); print_uart_int_dec(i);
-             print_uart(" ref="); print_float_fixed3(ref_buf[i]);
-             print_uart(" rvv="); print_float_fixed3(rvv_buf[i]);
-             print_uart(" diff="); 
-             float d = rvv_buf[i] - ref_buf[i];
-             print_float_fixed3(d);
-             print_uart("\r\n");
-        }
 
         // Compare
         float max_diff = 0.0f;

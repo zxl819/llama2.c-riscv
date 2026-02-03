@@ -1,9 +1,24 @@
+/*
+---
+title: Softmax RVV 正确性验证测试
+date: 2026-01-29
+description: 用于验证从 llama2.c-riscv 提取的 Softmax RVV 算子的正确性，包含参考实现对比与 MaxDiff 统计。
+author: zhaoxinlei
+version: 1.0
+---
+============================================================================================================================================================
+代码说明
+============================================================================================================================================================
+该测试程序提供了一个完整的回归环境：
+1. 集成了外部定义的 softmax_stable_rvv_fp32 算子。
+2. 内部实现了一个基于标量的 softmax_ref 作为 Golden 参考（包含简单的 expf 逻辑）。
+3. 使用 xorshift64* 算法生成稳定的随机测试激励，输入范围约为 [-3, 3]。
+4. 处理了异常捕获（handle_trap），当执行非法 RVV 指令时会通过 UART 打印诊断信息。
+5. 结果校验：计算 MaxDiff (L-inf norm)，容差设置为 1e-3，以允许向量多项式与标量多项式之间的微小误差。
+============================================================================================================================================================
+*/
+
 // Minimal bare-metal correctness test for softmax_rvv.c
-//
-// Build:
-//   make rvbareclang RV_BARE_APP=./test_softmax_rvv.c \
-//     RV_BARE_NAME=./test_softmax_rvv BARE_PLATFORM=fpga PRINT_WAY=uart \
-//     BARE_EMBED_BLOBS=0 RV_BARE_CLANG=~/newllvm/test_llvm/build/bin/clang
 
 #include <stdint.h>
 #include <stddef.h>

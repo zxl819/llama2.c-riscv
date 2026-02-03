@@ -1,4 +1,16 @@
-// Minimal bare-metal correctness test for matrix_kernel_qmatmul_f32
+// ---
+// author: zhaoxinlei
+// version: 1.0
+// ---
+// [代码说明]
+// 本文件是针对 matrix_kernel_qmatmul_f32 的最小裸机正确性测试。
+// 算法流程：
+// 1. 生成 N 维输入向量 x 和 [D x N] 的权重矩阵 w。
+// 2. 将 x 按组（GS=32）进行量化，生成 int8 的 xq 和 float 缩放因子 xs。
+// 3. 将 w 按组（GS=32）进行量化，生成 int8 的 wq 和 float 缩放因子 ws。
+// 4. 调用矩阵加速内核 (matrix_kernel_qmatmul_f32_noblk) 计算结果。
+// 5. 调用标量参考实现 (ref_qmatmul_f32) 计算结果，并逐 group 打印中间累加值以便对齐调试。
+// 6. 对比内核输出与参考输出的误差，确保在容差范围内。
 //
 // Build (example):
 //   make rvbareclang RV_BARE_APP=./test_matrix_kernel_qmatmul_f32.c \
@@ -129,6 +141,8 @@ static void quantize_per_group_i8(const float *x, int n, int gs, int8_t *xq, flo
     }
 }
 
+static void print_i32_dec(int32_t v);
+
 static void ref_qmatmul_f32(float *out,
                            const int8_t *xq, const float *xs,
                            const int8_t *wq, const float *ws,
@@ -136,12 +150,15 @@ static void ref_qmatmul_f32(float *out,
     const int num_groups = (n + gs - 1) / gs;
     const int groups_per_row = n / gs;
 
-    for (int i = 0; i < d; i++) {
-        float accf = 0.0f;
-        for (int g = 0; g < num_groups; g++) {
-            const int base = g * gs;
-            const int count = (base + gs <= n) ? gs : (n - base);
+    // Initialize output to zero to match kernel's additive behavior
+    for (int i = 0; i < d; i++) out[i] = 0.0f;
 
+    for (int g = 0; g < num_groups; g++) {
+        const int base = g * gs;
+        const int count = (base + gs <= n) ? gs : (n - base);
+        const float xscale = xs[g];
+
+        for (int i = 0; i < d; i++) {
             int32_t acc = 0;
             const int8_t *wrow = wq + (ptrdiff_t)i * (ptrdiff_t)n + (ptrdiff_t)base;
             const int8_t *xvec = xq + (ptrdiff_t)base;
@@ -150,10 +167,23 @@ static void ref_qmatmul_f32(float *out,
             }
 
             const float wscale = ws[(ptrdiff_t)i * (ptrdiff_t)groups_per_row + (ptrdiff_t)g];
-            const float xscale = xs[g];
-            accf += ((float)acc) * wscale * xscale;
+            out[i] += ((float)acc) * wscale * xscale;
         }
-        out[i] = accf;
+        #if MATRIX_KERNEL_DEBUG_PRINT && MATRIX_KERNEL_DEBUG_VERBOSE
+        // Print intermediate values to match kernel's debug log style [rvv_accum]
+        print_uart("  [ref_accum] accum_result chunk (group g=");
+        print_uart_int_dec(g); print_uart("):\r\n");
+        for (int i = 0; i < d; i++) {
+            // Only print first 16 and last element to keep log readable
+            if (i < 16 || i == d - 1) {
+                print_uart("    out["); print_uart_int_dec(i); print_uart("]=");
+                print_float_fixed3(out[i]);
+                print_uart("\r\n");
+            } else if (i == 16) {
+                print_uart("    ...\r\n");
+            }
+        }
+        #endif
     }
 }
 
@@ -236,14 +266,14 @@ int main(void) {
     enable_vector_state();
     init_uart(CLOCK_FREQUENCY, UART_BITRATE);
 
-    //print_uart("[test] matrix_kernel_qmatmul_f32...\r\n");
+    print_uart("[test] matrix_kernel_qmatmul_f32...\r\n");
 
     // Test sizes.
     // IMPORTANT: matrix_kernel_qmatmul_f32 assumes N is a multiple of GS so that
     // ws indexing becomes affine per row (groups_per_row = N/GS).
     // It also assumes per-group K (count) <= 32 (MK_KMAX).
     enum { GS = 32 };
-    enum { N = 32 };  // input dimension (model dim)
+    enum { N = 64 };  // input dimension (model dim)
     enum { D = 64 };  // output dimension (hidden_dim)
 
     _Static_assert(GS > 0, "GS must be > 0");

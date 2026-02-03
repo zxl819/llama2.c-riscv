@@ -433,7 +433,7 @@ rvbarenm:
 # Bare-metal linking using clang as the driver (kept as a convenience target).
 RV_BARE_CLANG ?= ~/newllvm/test_llvm/build/bin/clang
 RV_BARE_CLANG_MARCH ?= $(RV_MARCH)
-RV_BARE_CLANG_O ?= -O2
+RV_BARE_CLANG_O ?= -O1
 # Extra flags for the clang driver (e.g. -menable-experimental-extensions).
 RV_BARE_CLANG_EXTRA_FLAGS ?=
 #clang

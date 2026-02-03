@@ -21,7 +21,7 @@
 #include "matrix_kernel_1230.h"
 #include "matrix_kernel_noblk_1231.h"
 
-#define CLOCK_FREQUENCY 24000000
+#define CLOCK_FREQUENCY 50000000
 #define UART_BITRATE    115200
 
 // ---------------------------------------------------------------------------
@@ -243,7 +243,7 @@ int main(void) {
     // ws indexing becomes affine per row (groups_per_row = N/GS).
     // It also assumes per-group K (count) <= 32 (MK_KMAX).
     enum { GS = 32 };
-    enum { N = 32 };  // input dimension (model dim)
+    enum { N = 64 };  // input dimension (model dim)
     enum { D = 64 };  // output dimension (hidden_dim)
 
     _Static_assert(GS > 0, "GS must be > 0");
@@ -284,7 +284,7 @@ int main(void) {
     // print_vec_f32("[test] ws (scale over flattened w)", ws, (D * N + GS - 1) / GS);
 
     // Run kernel (use noblk variant) and reference
-    matrix_kernel_qmatmul_f32_noblk(out, xq, xs, wq, ws, N, D, GS, N);
+    matrix_kernel_qmatmul_f32_noblk_CT(out, xq, xs, wq, ws, N, D, GS, N);
     //print_uart_hex((uint64_t)(uintptr_t)out);
     //asm volatile(".word 0x4200007b");
     debug_delay_cycles(100);
