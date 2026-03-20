@@ -30,7 +30,6 @@ version: 1.0
 // That disables the standalone demo (main/UART/data globals) and only exposes
 // a callable Matrix-kernel function.
 #ifndef MATMUL_MATRIX_KERNEL_ONLY
-#include <string.h>
 //#include "uart.h"
 
 #include "uart_helper.c"
